@@ -1,0 +1,10 @@
+# 开发环境依赖（安装到项目 .venv/）
+# 注意：PyQt6 生态有两套 Fluent 发行版——
+#   PyQt-Fluent-Widgets  = PyQt5 专用（装了会和 PyQt6 QApplication 冲突，段错误）
+#   PyQt6-Fluent-Widgets = PyQt6 专用（本项目用这个）
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2
+PyQt6_sip==13.13.0
+PyQt6-Fluent-Widgets==1.11.3
+PyQt6-Frameless-Window==0.8.2
+darkdetect==0.8.0

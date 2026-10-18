@@ -1,0 +1,196 @@
+"""部署引导（F11）：重启输入法框架、打开配置工具、触发重新部署。
+
+关键工程约束：框架进程（ibus-daemon/fcitx5）是常驻进程，若由 QProcess 直接
+start 会一直占用 runner 导致任务永不完成。因此所有启动命令统一
+`setsid ... &` 脱离进程组，命令本身立即返回，runner 正常收尾。
+
+v1.0.6：rime 部署是「惰性」的——重启 ibus-daemon 只注册引擎、不实例化引擎，
+只有用户真正切换到「中文(Rime)」输入源时 ibus-engine-rime 才会跑部署。
+真机实证：连续两次「删 build + 重启框架」后 build 目录依旧不存在。
+因此「重新部署」升级为**主动部署**：直接调用 rime_deployer --build 编译
+生成 build/（rime_deployer 随 librime/ibus-rime 安装），失败再重启框架兜底。
+
+v1.0.26（审计修复）：rime_deployer 属于 librime-bin，Ubuntu 的 ibus-rime /
+fcitx5-rime **都不依赖**它（noble 文件清单实证），本安装器只装单个引擎包。
+旧脚本先 `rm -rf build` 再判断 deployer 是否存在：缺 deployer 时删了可用的
+build、只重启框架、`echo 已完成` 且退出码 0 —— 界面报「已修复」、体检仍
+BAD，属于拒绝过的「假成功」。现改为：编译进 `<build>.rime-new`，成功且
+非空才替换 build/；缺 deployer 时**不删任何文件**，由框架重启触发部署并
+轮询确认；任何失败一律 exit 1，让 runner 报失败并给出定向建议。
+"""
+
+from __future__ import annotations
+
+import os
+import shlex
+import shutil
+from pathlib import Path
+
+from core.runner import Step
+
+# rime 共享数据目录（rime-data 包在 Ubuntu/Debian/Deepin 的常见位置）
+_SHARED_DATA_CANDIDATES = (
+    "/usr/share/rime-data",
+    "/usr/share/rime",
+    "/usr/share/fcitx5/rime-data",
+    "/usr/local/share/rime-data",
+)
+
+# rime_deployer 的实际落点（PATH 之外的兜底；.desktop 启动时 PATH 可能被裁剪）
+_DEPLOYER_CANDIDATES = (
+    "/usr/bin/rime_deployer",
+    "/usr/local/bin/rime_deployer",
+    "/usr/lib/ibus-rime/rime_deployer",
+)
+
+
+def find_deployer() -> str | None:
+    """定位 rime_deployer：先查 PATH，再查发行版常见绝对路径。"""
+    found = shutil.which("rime_deployer")
+    if found:
+        return found
+    for candidate in _DEPLOYER_CANDIDATES:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def rime_shared_data_dir() -> str:
+    for candidate in _SHARED_DATA_CANDIDATES:
+        if Path(candidate).is_dir():
+            return candidate
+    return _SHARED_DATA_CANDIDATES[0]
+
+
+def build_deploy_script(frontend: str, rime_dir) -> str:
+    """主动部署脚本：编译到 staging → 校验 → 替换 build/ → 重启框架（v1.0.26）。
+
+    - rime_deployer 用法：--build <user_data_dir> <shared_data_dir> <staging_dir>；
+      staging 用 `<build>.rime-new`，**不再先删现有 build**（失败时用户的原
+      配置仍可继续用，这是旧实现最伤人的地方）；
+    - 缺 deployer（Ubuntu 未装 librime-bin）时不删任何文件，改为重启框架并
+      轮询 build/ 是否被引擎重建，超时则 exit 1；
+    - 所有失败路径 exit 1：runner 判失败 → Step.hint_key 给定向建议，
+      绝不再出现「提示成功但体检依旧 BAD」。
+    """
+    build_dir = Path(rime_dir) / "build"
+    staging = Path(str(build_dir) + ".rime-new")
+    deployer = find_deployer()
+    shared_candidates = " ".join(shlex.quote(c) for c in _SHARED_DATA_CANDIDATES)
+    deployer_candidates = " ".join(shlex.quote(c) for c in _DEPLOYER_CANDIDATES)
+    # 冒烟/自动化测试必须能「只构建、不碰输入法」：默认重启会杀掉开发者本机的
+    # fcitx5（2026-10-18 实测：跑真机部署脚本把在位 fcitx5 杀掉了）。
+    no_restart = os.environ.get("RIME_INSTALLER_NO_RESTART") == "1"
+    start = (
+        "echo '[测试模式] 跳过重启输入法框架'"
+        if no_restart
+        else _start_cmd(frontend)
+    )
+
+    lines = [
+        f"BUILD={shlex.quote(str(build_dir))}",
+        f"NEW={shlex.quote(str(staging))}",
+        f"USERDIR={shlex.quote(str(rime_dir))}",
+        f"SHARED={shlex.quote(rime_shared_data_dir())}",
+        f"DEPLOYER={shlex.quote(deployer or '')}",
+        # v1.0.8：共享数据目录运行时二次探测（发行版安装位置可能不同）
+        'if [ ! -d "$SHARED" ]; then',
+        f"  for d in {shared_candidates}; do",
+        '    [ -d "$d" ] && SHARED="$d" && break',
+        "  done",
+        "fi",
+        # v1.0.26：PATH 被裁剪时（.desktop/pkexec）再按绝对路径兜一次
+        'if [ -z "$DEPLOYER" ]; then',
+        f"  for c in {deployer_candidates}; do",
+        '    [ -x "$c" ] && DEPLOYER="$c" && break',
+        "  done",
+        "fi",
+        'if [ -z "$DEPLOYER" ]; then',
+        '  DEPLOYER="$(command -v rime_deployer 2>/dev/null || true)"',
+        "fi",
+        'if [ -n "$DEPLOYER" ]; then',
+        '  rm -rf "$NEW"',
+        '  if ! "$DEPLOYER" --build "$USERDIR" "$SHARED" "$NEW"; then',
+        '    echo "rime_deployer 编译失败，已保留原有 build 目录（未删除任何文件）" >&2',
+        "    exit 1",
+        "  fi",
+        '  if [ -z "$(ls -A "$NEW" 2>/dev/null)" ]; then',
+        '    echo "rime_deployer 退出码为 0 但没有产出任何文件，已保留原有 build 目录" >&2',
+        "    exit 1",
+        "  fi",
+        '  rm -rf "$BUILD" && mv "$NEW" "$BUILD"',
+        '  echo "已重新生成 build（$BUILD）"',
+        "  " + start,
+        "else",
+        '  echo "未找到 rime_deployer（Ubuntu 需另装 librime-bin）：不删除现有 build，改为重启框架由引擎自行部署"',
+    ]
+    if no_restart:
+        lines.append('  echo "[测试模式] 跳过重启框架与部署轮询"')
+    else:
+        lines += [
+            "  " + start,
+            "  i=0",
+            '  while [ "$i" -lt 8 ] && [ ! -d "$BUILD" ]; do sleep 1; i=$((i+1)); done',
+            '  if [ ! -d "$BUILD" ]; then',
+            '    echo "重启框架后仍未生成 build：请安装 librime-bin 后重试；'
+            '或在输入法里切换一次 Rime 触发部署" >&2',
+            "    exit 1",
+            "  fi",
+            '  echo "框架已自行生成 build（$BUILD）"',
+        ]
+    lines += ["fi", "echo '已完成'"]
+    return "\n".join(lines)
+
+
+def _start_cmd(frontend: str) -> str:
+    if frontend == "ibus-rime":
+        return "pkill -x ibus-daemon 2>/dev/null; sleep 0.3; setsid ibus-daemon -drxR >/dev/null 2>&1 &"
+    if frontend == "fcitx5-rime":
+        return "pkill -x fcitx5 2>/dev/null; sleep 0.3; setsid fcitx5 -d >/dev/null 2>&1 &"
+    return "pkill -x fcitx 2>/dev/null; sleep 0.3; setsid fcitx -d >/dev/null 2>&1 &"
+
+
+def config_tool_command(frontend: str) -> str:
+    """打开输入法配置工具的命令（添加/管理输入法入口）。"""
+    if frontend == "ibus-rime":
+        return "setsid ibus-setup >/dev/null 2>&1 &"
+    if frontend == "fcitx5-rime":
+        return "setsid fcitx5-configtool >/dev/null 2>&1 &"
+    return "setsid fcitx-configtool >/dev/null 2>&1 &"
+
+
+def build_restart_steps(frontend: str) -> list[Step]:
+    """重启输入法框架（触发 rime 自动部署）。"""
+    return [
+        Step(
+            f"重启输入法框架（{frontend}）",
+            ["bash", "-c", _start_cmd(frontend) + "\necho '已发送重启指令'"],
+            weight=1,
+        )
+    ]
+
+
+def build_redeploy_steps(frontend: str, rime_dir) -> list[Step]:
+    """主动部署：rime_deployer 编译生成 build + 重启框架（v1.0.6）。"""
+    return [
+        Step(
+            "重新部署（rime_deployer 编译 + 重启框架）",
+            ["bash", "-c", build_deploy_script(frontend, rime_dir)],
+            weight=1,
+            hint_key="msg.deploy_failed",
+        )
+    ]
+
+
+def build_open_config_tool_steps(frontend: str) -> list[Step]:
+    """打开框架配置工具（ibus-setup / fcitx5-configtool）。"""
+    tool = "ibus-setup" if frontend == "ibus-rime" else (
+        "fcitx5-configtool" if frontend == "fcitx5-rime" else "fcitx-configtool"
+    )
+    return [
+        Step(
+            f"打开输入法配置工具（{tool}）",
+            ["bash", "-c", config_tool_command(frontend) + f"\necho '已启动 {tool}'"],
+            weight=1,
+        )
+    ]

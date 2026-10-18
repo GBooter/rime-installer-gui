@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+build/
+*.deb
+.Trash*
+.venv/
+.workbuddy/
+rayburst-main/
+resources/plum/package/
+.smoke-tmp/
+
+# 截图原图（2x 尺寸，单张约 700KB），仓库内只保留 docs/screenshots 下的
+# 1200px 规范化版本；原图留在本地便于重新导出。
+图片/

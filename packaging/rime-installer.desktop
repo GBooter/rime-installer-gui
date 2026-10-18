@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=中州韵输入法安装器
+Name[en]=RIME Installer
+Comment=安装与管理中州韵输入法引擎及方案
+Comment[en]=Install and manage the RIME input method engine and schemata
+Exec=rime-installer
+Icon=rime-installer
+Terminal=false
+StartupNotify=true
+Categories=Utility;System;Settings;
+Keywords=rime;输入法;中州韵;ibus;fcitx;
+X-AppAuthor=Feelup
