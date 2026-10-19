@@ -73,6 +73,9 @@ Description: 中州韵输入法安装器 (RIME Installer)
  Graphical installer for the RIME input method engine and input schemata.
  Supports X11 and Wayland, with built-in aria2 accelerated downloads,
  plum (东风破) schema management, snapshot backup and clean uninstall.
+ Works on Ubuntu 24.04+, Linux Mint 22+ and Deepin 25.2+.
+ Version support is family/baseline matched (see core/compat.py), so later
+ system releases keep working without an installer update.
 EOF
 
 cat > "$BUILD/usr/bin/rime-installer" <<'EOF'

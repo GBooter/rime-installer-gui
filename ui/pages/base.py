@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QSize
+from PyQt6.QtCore import QSize, QThread
 from PyQt6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import CaptionLabel, SimpleCardWidget, TitleLabel
@@ -16,6 +16,32 @@ STATUS_COLORS_DARK = {"ok": "#5FD35F", "bad": "#FF7A7A", "warn": "#E5B567", "mut
 
 #: 运行期色板：整体替换内容（非换引用），各页面 fill 时实时查表
 STATUS_COLORS = dict(STATUS_COLORS_LIGHT)
+
+
+def reap_worker(worker: QThread | None, timeout_ms: int = 5000) -> bool:
+    """等后台 ``QThread`` 真正退出；返回 True 表示引用已可安全丢弃。
+
+    v1.0.33 真机闪退根因修复：QThread 子类的「完成」信号是在 ``run()``
+    **内部**发出的（``self.done.emit(...)`` 位于 run() 末尾），槽函数收到
+    信号时线程往往还走在退出序列里——``isRunning()`` 仍为真。此刻丢掉
+    最后一个 Python 引用，包装对象立即销毁 → ``~QThread()`` 撞上
+    ``isRunning()`` → Qt 打「QThread: Destroyed while thread is still
+    running」并 qFatal → SIGABRT（退出码 134）。
+
+    真机实证（Ubuntu 24.04 / Linux Mint 22.3，v1.0.32）：launcher.log 里
+    每次退出码 134 前都有该行 stderr；崩溃时刻与「任务结束 →
+    redetect_async」「体检页 bind → AptHealthWorker」的完成时刻吻合——
+    用户反馈的「点很多功能就闪退」，即每个任务结束/页面绑定都会触发一次
+    该竞态（离线最小复现：同构代码 300 轮内必现 134 + 同一行 stderr）。
+
+    ``wait()`` 期间 sip 会释放 GIL，不会与正在退出的工作线程抢解释器锁；
+    完成信号本就发在 run() 末尾，正常路径只阻塞毫秒级。
+    """
+    if worker is None:
+        return True
+    if worker.isRunning():
+        worker.wait(timeout_ms)
+    return not worker.isRunning()
 
 
 def apply_status_palette(mode: str) -> None:

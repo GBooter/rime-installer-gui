@@ -100,12 +100,46 @@ class EnvReport:
         """已设定但值与当前前端冲突的环境变量键列表（未设定不计入，v1.0.5）。"""
         if not (self.active_frontend or self.running_frontends):
             return []
-        expected = EXPECTED_ENV.get(self.active_frontend or self.recommended_frontend, {})
+        # v1.0.34：比对基准改 effective_frontend——已装引擎是 apt 层面的
+        # ground truth，瞬时信号（某次启动的 GTK_IM_MODULE、进程起没起）
+        # 会让「实际在用的前端」和「装机时装的前端」对不上。
+        expected = EXPECTED_ENV.get(self.effective_frontend, {})
         return [
             key
             for key, value in expected.items()
             if self.im_env_vars.get(key, "") and self.im_env_vars[key] != value
         ]
+
+    @property
+    def effective_frontend(self) -> str:
+        """v1.0.34：一切写操作统一使用的「事实前端」。
+
+        已安装的引擎包是 apt 层面的 ground truth，优先于任何瞬时信号：
+
+        - ``GTK_IM_MODULE`` 只是**某一次启动环境**的快照——用户终端里
+          export 过、或从别的会话启动，值就跟着变；
+        - 框架进程有没有在跑是**时序**——装完引擎到重启框架之间它不在跑。
+
+        Mint 22.3 真机实证（故障日志）：首次启动环境干净，按 Cinnamon 默认
+        装了 ibus-rime、方案落 ``~/.config/ibus/rime``；重开应用后启动环境
+        带着 ``GTK_IM_MODULE=fcitx``，``active_frontend`` 变成 fcitx-rime，
+        于是写登录环境变量、重启框架（pkill/setsid fcitx——根本没装，静默
+        无操作）、打开配置工具（fcitx-configtool 不存在）全部对着 fcitx 跑，
+        **ibus-daemon 从未被重启 → ibus 从未加载 rime 组件 → 输入源列表里
+        始终没有「中文(Rime)」**，用户体感「装完找不到中州韵输入法选项」。
+
+        因此：装了几个引擎包就以哪个为准；只在**一个都没装**时才采信
+        active_frontend（用户在用的）与 recommended_frontend（按桌面猜）。
+        """
+        installed = self.installed_engine_packages
+        if len(installed) == 1:
+            return installed[0]
+        if installed:
+            # 多个引擎并存时，与运行/环境信号匹配的那个优先；都不匹配取第一个
+            if self.active_frontend in installed:
+                return self.active_frontend
+            return installed[0]
+        return self.active_frontend or self.recommended_frontend
 
 
 def _detect_os(report: EnvReport) -> None:
@@ -159,6 +193,21 @@ def _detect_engine(report: EnvReport) -> None:
 
 
 def _recommend_frontend(report: EnvReport) -> str:
+    # v1.0.34：已装引擎优先于一切瞬时信号（与 effective_frontend 同口径）。
+    # 旧实现把 active_frontend 排在最前，而它只是一次启动环境的快照：
+    # Mint 真机上装完 ibus-rime 后重开应用（终端里 GTK_IM_MODULE=fcitx），
+    # 推荐前端翻成 fcitx-rime，再点一次「安装引擎」就会装错包。
+    installed = [
+        frontend
+        for frontend, pkg in config.ENGINE_PACKAGES.items()
+        if report.engine_packages.get(pkg, False)
+    ]
+    if len(installed) == 1:
+        return installed[0]
+    if installed:
+        if report.active_frontend in installed:
+            return report.active_frontend
+        return installed[0]
     if report.active_frontend:
         return report.active_frontend
     desktop = report.desktop.upper()
@@ -167,15 +216,21 @@ def _recommend_frontend(report: EnvReport) -> str:
     # 边缘场景（极简会话/开机早期）仍会走到这里，补 "DDE" 防误推 ibus-rime。
     if "DEEPIN" in desktop or "DDE" in desktop or "KDE" in desktop:
         return "fcitx5-rime"
-    if "GNOME" in desktop:
+    # （v1.0.29 的「已装引擎优先」逻辑已上移到函数开头：那里连
+    #  active_frontend 一并压过，见 v1.0.34 注释。）
+    # Cinnamon（Linux Mint）：与 GNOME 一样用 gsettings 输入源 + IBus，
+    # 是 Mint 上的合理默认（真机装有 fcitx 时由 active_frontend 旁路）。
+    if "GNOME" in desktop or "CINNAMON" in desktop or "MINT" in desktop:
         return "ibus-rime"
     return "ibus-rime"
 
 
 def _detect_rime_dir(report: EnvReport) -> None:
-    candidates: list[Path] = []
-    if report.active_frontend:
-        candidates.append(config.RIME_USER_DIRS[report.active_frontend])
+    # v1.0.34：候选顺序改为「事实前端」打头。旧实现把 active_frontend 的
+    # 目录排第一，而它可能只是一次启动环境的快照（Mint 真机：装着
+    # ibus-rime、active 翻成 fcitx-rime，若 ~/.config/fcitx/rime 恰好
+    # 存在——用户手工试过 fcitx——配置目录就会指错，备份/部署全跑偏）。
+    candidates: list[Path] = [config.RIME_USER_DIRS[report.effective_frontend]]
     candidates.extend(config.RIME_USER_DIRS[f] for f in report.running_frontends)
     candidates.append(config.RIME_USER_DIRS[report.recommended_frontend])
     for candidate in candidates:

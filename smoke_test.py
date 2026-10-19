@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -24,14 +25,16 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import config  # noqa: E402
-from core import doctor, i18n, theme  # noqa: E402
+from core import apt_mirror, compat, doctor, i18n, theme  # noqa: E402
 from core.apt_mirror import (  # noqa: E402
     Mirror,
+    _codenames_from_text,
     build_switch_steps,
     current_mirror_name,
     is_ubuntu,
     measure_mirror_latency,
     mirrors,
+    sources_codenames,
     speedtest_urls,
     system_codename,
 )
@@ -40,8 +43,15 @@ from core.deploy_guide import (  # noqa: E402
     build_redeploy_steps,
     build_restart_steps,
 )
-from core.detector import EnvReport, _recommend_frontend, detect  # noqa: E402
+from core.detector import (  # noqa: E402
+    EnvReport,
+    _detect_rime_dir,
+    _recommend_frontend,
+    detect,
+)
 from core.doctor import (  # noqa: E402
+    _apt_codename_check,
+    _apt_sources_check,
     _fcitx5_input_methods,
     build_fix_all_steps,
     build_fix_steps,
@@ -448,11 +458,162 @@ def check_detector() -> list[str]:
         ("Deepin", "fcitx5-rime"),
         ("KDE", "fcitx5-rime"),
         ("ubuntu:GNOME", "ibus-rime"),
+        # v1.0.29：Linux Mint 的 XDG_CURRENT_DESKTOP 实测为 "X-Cinnamon"
+        ("X-Cinnamon", "ibus-rime"),
         ("unknown", "ibus-rime"),
     ]:
         got = _recommend_frontend(EnvReport(active_frontend=None, desktop=desktop))
         if got != expect:
             errors.append(f"_recommend_frontend(desktop={desktop!r}) 应为 {expect}: {got}")
+
+    # v1.0.29：无运行中框架时「已装引擎」优先于桌面猜测（否则推荐一个没装的引擎）
+    fcitx_only = EnvReport(
+        active_frontend=None,
+        desktop="ubuntu:GNOME",
+        engine_packages={"ibus-rime": False, "fcitx5-rime": True, "fcitx-rime": False},
+    )
+    if _recommend_frontend(fcitx_only) != "fcitx5-rime":
+        errors.append("已装 fcitx5-rime 而框架未运行时应推荐 fcitx5-rime")
+    both = EnvReport(
+        active_frontend=None,
+        desktop="ubuntu:GNOME",
+        engine_packages={"ibus-rime": True, "fcitx5-rime": True, "fcitx-rime": False},
+    )
+    if _recommend_frontend(both) != "ibus-rime":
+        errors.append("多个引擎都装且无运行信号时应取第一个（ibus-rime）")
+    return errors
+
+
+def check_frontend_consistency() -> list[str]:
+    """v1.0.34：前端一致性回归（Mint 22.3「装完找不到输入法选项」根因）。
+
+    真机画像（故障日志实证）：首次启动环境干净 → 按 Cinnamon 默认装了
+    ibus-rime、方案落 ~/.config/ibus/rime；重开应用后启动环境带着
+    ``GTK_IM_MODULE=fcitx``（用户终端里 export 过 / 从别的会话启动）→
+    ``active_frontend`` 翻成 fcitx-rime。旧实现从此把写登录环境变量、
+    重启框架（pkill/setsid fcitx——根本没装，静默无操作）、配置工具、
+    输入源注册全部打到 fcitx 上，**ibus-daemon 从未被重启 → 输入源列表
+    里始终没有「中文(Rime)」**。
+
+    修复口径：已安装的引擎包是 apt 层面的 ground truth，一切写操作以
+    ``effective_frontend`` 为锚；瞬时信号只在「一个引擎都没装」时采信。
+    """
+    errors: list[str] = []
+
+    def make_report(engines, active=None, desktop="X-Cinnamon", env=None):
+        report = EnvReport(
+            os_name="Linux Mint",
+            os_version="22.3",
+            desktop=desktop,
+            active_frontend=active,
+            running_frontends=[active] if active else [],
+            engine_packages={
+                "ibus-rime": "ibus-rime" in engines,
+                "fcitx5-rime": "fcitx5-rime" in engines,
+                "fcitx-rime": "fcitx-rime" in engines,
+            },
+            im_env_vars=env or {},
+        )
+        report.recommended_frontend = _recommend_frontend(report)
+        return report
+
+    # 1. Mint 漂移画像：装着 ibus-rime + active=fcitx-rime + 环境变量全 fcitx
+    drift = make_report(
+        {"ibus-rime"},
+        active="fcitx-rime",
+        env={
+            "GTK_IM_MODULE": "fcitx",
+            "QT_IM_MODULE": "fcitx",
+            "XMODIFIERS": "@im=fcitx",
+            "SDL_IM_MODULE": "fcitx",
+        },
+    )
+    if drift.effective_frontend != "ibus-rime":
+        errors.append(
+            f"漂移画像下 effective_frontend 应为 ibus-rime: {drift.effective_frontend}"
+        )
+    if drift.recommended_frontend != "ibus-rime":
+        errors.append(
+            f"漂移画像下 recommended_frontend 应为 ibus-rime: {drift.recommended_frontend}"
+        )
+    if drift.env_vars_ok is not False:
+        errors.append("漂移画像下环境变量（fcitx 值）应判为冲突")
+    if "GTK_IM_MODULE" not in drift.env_var_mismatches:
+        errors.append(f"冲突键应含 GTK_IM_MODULE: {drift.env_var_mismatches}")
+
+    # 2. rime 用户目录候选顺序：effective 打头（即使用户手工试过 fcitx、
+    #    ~/.config/fcitx/rime 存在，也不能把配置目录指到那里）
+    orig_dirs = config.RIME_USER_DIRS
+    try:
+        config.RIME_USER_DIRS = {
+            "ibus-rime": _smoke_rime_dir(),
+            "fcitx-rime": _smoke_rime_dir(),
+            "fcitx5-rime": _smoke_rime_dir(),
+        }
+        drift_dir = make_report({"ibus-rime"}, active="fcitx-rime")
+        _detect_rime_dir(drift_dir)
+        if drift_dir.rime_user_dir != config.RIME_USER_DIRS["ibus-rime"]:
+            errors.append(
+                f"漂移画像下 rime 用户目录应取 ibus-rime 的: {drift_dir.rime_user_dir}"
+            )
+    finally:
+        config.RIME_USER_DIRS = orig_dirs
+
+    # 3. 体检与修复：input_source 必须走 Cinnamon 输入源分支并产出
+    #    gsettings 一键修复；im_env / deployed 修复脚本同样锚 ibus
+    drift.rime_user_dir = _smoke_rime_dir()
+    orig_read = doctor._read_input_sources
+    doctor._read_input_sources = lambda schema: "@a(ss) []"
+    try:
+        results = {r.key: r for r in run_checks(drift)}
+        src = results.get("input_source")
+        if src is None or src.level != "bad":
+            errors.append(f"漂移画像下应报「输入源未添加」: {src}")
+        elif not src.fixable:
+            errors.append("ibus-rime 已装时输入源未添加应可一键修复")
+        steps = build_fix_steps("input_source", drift)
+        script = steps[0].argv[-1] if steps else ""
+        if "gsettings set" not in script or "org.cinnamon.desktop.input-sources" not in script:
+            errors.append("输入源修复步骤应写入 Cinnamon 输入源（gsettings）")
+        if "ibus-daemon" not in script:
+            errors.append("输入源修复末尾应重启 ibus-daemon（effective 前端）")
+        im_script = build_fix_steps("im_env", drift)[0].argv[-1]
+        if "GTK_IM_MODULE=ibus" not in im_script:
+            errors.append("环境变量修复应写 ibus 值（漂移画像下绝不能写 fcitx）")
+        dep_steps = build_fix_steps("deployed", drift)
+        if dep_steps:
+            # 冒烟开关 RIME_INSTALLER_NO_RESTART=1 会把重启步换成 echo，
+            # 断言必须与开关自洽（v1.0.28 教训）：只在不跳过重启时查 ibus
+            if os.environ.get("RIME_INSTALLER_NO_RESTART") != "1" and (
+                "ibus-daemon" not in dep_steps[0].argv[-1]
+            ):
+                errors.append("部署修复应重启 ibus-daemon（effective 前端）")
+            if str(drift.rime_user_dir) not in dep_steps[0].argv[-1]:
+                errors.append("部署修复应针对 effective 前端对应的 rime 用户目录")
+    finally:
+        doctor._read_input_sources = orig_read
+
+    # 4. 无引擎时保持原口径：运行中的框架 / 桌面猜测仍然作数
+    fresh_gnome = make_report(set(), active="ibus-rime", desktop="ubuntu:GNOME")
+    if fresh_gnome.effective_frontend != "ibus-rime":
+        errors.append("无引擎时 effective 应跟随运行中的框架")
+    for desktop, expect in (("KDE", "fcitx5-rime"), ("X-Cinnamon", "ibus-rime")):
+        got = _recommend_frontend(EnvReport(active_frontend=None, desktop=desktop))
+        if got != expect:
+            errors.append(f"_recommend_frontend(desktop={desktop!r}) 应为 {expect}: {got}")
+
+    # 5. 双引擎并存：与 active 匹配的优先；都不匹配取第一个
+    both_fcitx5 = make_report({"ibus-rime", "fcitx5-rime"}, active="fcitx5-rime")
+    if both_fcitx5.effective_frontend != "fcitx5-rime":
+        errors.append("双引擎并存时应取与运行信号匹配的 fcitx5-rime")
+    both_none = make_report({"ibus-rime", "fcitx5-rime"}, active=None)
+    if both_none.effective_frontend != "ibus-rime":
+        errors.append("双引擎并存且无运行信号时应取 ibus-rime")
+
+    # 6. fcitx5 装机画像不受影响：装着 fcitx5-rime 时一切照旧锚 fcitx5
+    f5 = make_report({"fcitx5-rime"}, active="fcitx5-rime", desktop="KDE")
+    if f5.effective_frontend != "fcitx5-rime":
+        errors.append("fcitx5-rime 装机画像下 effective 应为 fcitx5-rime")
     return errors
 
 
@@ -557,6 +718,13 @@ def check_state_machine() -> list[str]:
     deepin_rule = StateMachine(_report_no_rime_dir()).rule("switch_mirror")
     if deepin_rule.enabled is not False or "Ubuntu" not in deepin_rule.reason:
         errors.append(f"Deepin 上 switch_mirror 应禁用并说明: {deepin_rule}")
+    # v1.0.29：Linux Mint 同样禁用（源由 mint 自带工具管理），但原因不得照抄
+    # Deepin 的「官方源在国内」——那会让人以为换个镜像地址就行
+    mint_report = _report_with_engine()
+    mint_report.os_name = "Linux Mint"
+    mint_rule = StateMachine(mint_report).rule("switch_mirror")
+    if mint_rule.enabled is not False or "Mint" not in mint_rule.reason:
+        errors.append(f"Linux Mint 上 switch_mirror 应禁用并说明原因: {mint_rule}")
 
     busy = StateMachine(_report_with_engine(), busy=True, installed_schemes=2)
     for action in (
@@ -626,6 +794,78 @@ def check_engine_service() -> list[str]:
             errors.append(f"安装应只有一次 pkexec 提权: {joined}")
         if shutil.which("nice") and "nice" not in joined:
             errors.append(f"apt 应经 nice 降优先级: {joined}")
+
+    # ---- v1.0.29：Mint 22.3 真机「apt update 退出码 100 短路整条链」回归 ----
+    # 真机日志：`apt-get update && echo ... && apt-get install` 里 update 因失效
+    # 第三方源（ci.deepin.com 404）返回 100，install 一步都没跑，用户只看到
+    # 「更新软件源索引并安装引擎」失败。update 必须尽力而为。
+    install_steps = build_install_steps("fcitx-rime", update_first=True)
+    if len(install_steps) != 1:
+        errors.append("安装步骤应始终为单步")
+    else:
+        step = install_steps[0]
+        joined = " ".join(step.argv)
+        if "||" not in joined:
+            errors.append("apt update 失败必须被容忍（缺 || 兜底会短路 install）")
+        if "echo" not in joined:
+            errors.append("apt update 失败时应有日志留痕（echo 警告）")
+        # update 段、install 段的先后顺序：容错语句必须包住 update，而不是包住 install
+        upd_at = joined.find("apt-get update")
+        inst_at = joined.find("apt-get install -y fcitx-rime")
+        if upd_at < 0 or inst_at < 0 or upd_at > inst_at:
+            errors.append(f"安装脚本顺序异常（update 应在 install 之前）: {joined[:160]}")
+        if joined.find("||") > inst_at:
+            errors.append("容错分支须紧跟 update，不能落在 install 之后")
+        # 部署工具（rime_deployer）随引擎一起装，且失败不得判定整个任务失败
+        deployer = config.ENGINE_DEPLOYER_PACKAGE
+        if f"install -y {deployer}" not in joined:
+            errors.append(f"安装引擎时应顺带安装 {deployer}")
+        if step.hint_key != "msg.engine_install_failed":
+            errors.append(f"引擎安装失败应带定向提示: {step.hint_key!r}")
+        # 内层脚本必须能通过 bash 语法检查（花括号容错组写错会整条命令崩）
+        inner = shlex.split(step.argv[2])[-1]
+        parsed = subprocess.run(
+            ["bash", "-n", "-c", inner], capture_output=True, text=True
+        )
+        if parsed.returncode != 0:
+            errors.append(f"安装脚本 bash 语法错误: {parsed.stderr.strip()[:160]}")
+
+    # ---- v1.0.35：fcitx4 顺手补装配置工具包（fcitx-configtool 不在 fcitx-rime
+    # 依赖链里，纯净 fcitx4 机器上「打开配置工具」静默失败）----
+    fcitx4_extras = config.FRONTEND_EXTRA_PACKAGES.get("fcitx-rime", [])
+    if not fcitx4_extras:
+        errors.append("FRONTEND_EXTRA_PACKAGES 应为 fcitx-rime 配置附加包")
+    fcitx4_script = " ".join(build_install_steps("fcitx-rime", update_first=True)[0].argv)
+    for extra in fcitx4_extras:
+        extra_at = fcitx4_script.find(f"install -y {extra}")
+        if extra_at < 0:
+            errors.append(f"fcitx4 安装引擎时应顺带安装 {extra}")
+        elif "|| echo" not in fcitx4_script[extra_at:]:
+            errors.append(f"{extra} 安装必须 best-effort（失败不得判任务失败）")
+    # 防串味：其他前端的安装链（含跳过 update 的变体）不得出现 fcitx4 专属包
+    for other in ("ibus-rime", "fcitx5-rime"):
+        for update_first in (True, False):
+            other_script = " ".join(
+                build_install_steps(other, update_first=update_first)[0].argv
+            )
+            for extra in fcitx4_extras:
+                if extra in other_script:
+                    errors.append(
+                        f"{other}（update_first={update_first}）安装链不应包含 "
+                        f"{extra}（fcitx4 专属，fcitx5/ibus 配置工具随框架包提供）"
+                    )
+    # 卸载不主动 purge 附加包（用户可能自装 / fcitx4 仍在用），交给 autoremove
+    uninstall_script = " ".join(build_uninstall_steps("fcitx-rime")[0].argv)
+    for extra in fcitx4_extras:
+        if extra in uninstall_script:
+            errors.append(f"卸载引擎时不应主动 purge {extra}")
+
+    skipped_update = build_install_steps("ibus-rime", update_first=False)
+    skipped_cmd = " ".join(skipped_update[0].argv) if skipped_update else ""
+    if "apt-get update" in skipped_cmd:
+        errors.append("跳过 update 时不应包含 apt-get update")
+    if f"install -y {config.ENGINE_DEPLOYER_PACKAGE}" not in skipped_cmd:
+        errors.append("跳过 update 时仍应安装部署工具")
 
     steps = build_install_steps("ibus-rime", update_first=False)
     if len(steps) != 1:
@@ -956,6 +1196,8 @@ def check_doctor() -> list[str]:
         "input_source",
         "autostart",
         "rime_dir",
+        "apt_codename",
+        "apt_sources",
     ):
         if expected not in keys:
             errors.append(f"缺少体检项: {expected}")
@@ -1039,6 +1281,15 @@ def check_doctor() -> list[str]:
     from core.translations.en import EN_TEXT
 
     sample_reports = [report, _report_no_engine()]
+    # v1.0.29：Linux Mint（Cinnamon）走 org.cinnamon.desktop.input-sources，
+    # 新增分支（读不到 / 已注册 / 未注册）的英文文案同样要覆盖
+    cinnamon_sample = _report_no_engine()
+    cinnamon_sample.os_name = "Linux Mint"
+    cinnamon_sample.desktop = "X-Cinnamon"
+    cinnamon_sample.engine_packages["ibus-rime"] = True
+    cinnamon_sample.active_frontend = "ibus-rime"
+    cinnamon_sample.running_frontends = ["ibus-rime"]
+    sample_reports.append(cinnamon_sample)
     for sample in sample_reports:
         for item in run_checks(sample, []):
             title_key = f"doctor.check.{item.key}.title"
@@ -1174,6 +1425,234 @@ def check_doctor() -> list[str]:
         if _fcitx5_input_methods(empty) != "":
             errors.append("无输入法段应返回空串")
 
+    # ---- v1.0.31：apt 源代号一致性体检 ----
+    # a) 解析器：deb822 Suites: 行 / 传统 deb 行 / 口袋后缀剥离 / 固定词剔除
+    parsed = _codenames_from_text(
+        "# 注释行\n"
+        "Types: deb\n"
+        "URIs: http://mirror.example.com/ubuntu/\n"
+        "Suites: noble noble-updates noble-backports\n"
+        "deb http://other.example.com/debian stable main\n"
+        "deb [arch=amd64] http://ppa.example.com/ubuntu/ppa jammy main\n"
+        "deb-src http://deepin.example.com deepin main\n"
+        "deb http://broken.example.com noble-security main\n"
+    )
+    if parsed != ["noble", "jammy"]:
+        errors.append(f"源代号解析异常（后缀/固定词处理有误）: {parsed}")
+    # 真实系统上的源文件必须可读且不抛异常（dev 环境无源文件也为合法结果）
+    try:
+        real_codenames = sources_codenames()
+    except OSError as exc:  # 探测类函数绝不允许把异常泄进 Qt 槽
+        errors.append(f"sources_codenames 抛异常: {exc}")
+    else:
+        for codename, path in real_codenames:
+            if not re.fullmatch(r"[a-z][a-z0-9]*", codename) or not path:
+                errors.append(f"sources_codenames 返回异常条目: {codename} {path}")
+
+    # b) 三态 + 家族口径（打桩 os-release 与源内容，不依赖真机）
+    orig_release = doctor._read_os_release
+    orig_sources = apt_mirror.sources_codenames
+    try:
+        # Mint：VERSION_CODENAME=zena + UBUNTU_CODENAME=noble 并存，都应放行
+        doctor._read_os_release = lambda: {
+            "NAME": "Linux Mint",
+            "VERSION_CODENAME": "zena",
+            "UBUNTU_CODENAME": "noble",
+        }
+        apt_mirror.sources_codenames = lambda: [
+            ("zena", "/etc/apt/sources.list.d/official-package-repositories.list"),
+            ("noble", "/etc/apt/sources.list.d/official-package-repositories.list"),
+        ]
+        mint_ok = _apt_codename_check()
+        if mint_ok.level != doctor.OK:
+            errors.append(f"Mint 双代号应判 OK: {mint_ok.level} {mint_ok.detail[:40]}")
+        # 升级后残留旧代号 → WARN，且详情要点名残留代号与所在文件
+        apt_mirror.sources_codenames = lambda: [
+            ("zena", "/etc/apt/sources.list.d/ubuntu.sources"),
+            ("resolute", "/etc/apt/sources.list.d/ubuntu.sources"),
+        ]
+        mint_bad = _apt_codename_check()
+        if mint_bad.level != doctor.WARN:
+            errors.append(f"旧代号残留应判 WARN: {mint_bad.level}")
+        if "zena" not in mint_bad.detail or "ubuntu.sources" not in mint_bad.detail:
+            errors.append(f"WARN 详情应列出残留代号与文件: {mint_bad.detail[:60]}")
+        # Ubuntu：只认 VERSION_CODENAME；未来版本（28.04）同样正确比对
+        doctor._read_os_release = lambda: {
+            "NAME": "Ubuntu",
+            "VERSION_CODENAME": "resolute",
+        }
+        apt_mirror.sources_codenames = lambda: [
+            ("resolute", "/etc/apt/sources.list.d/ubuntu.sources"),
+            ("resolute", "/etc/apt/sources.list"),
+        ]
+        ubuntu_ok = _apt_codename_check()
+        if ubuntu_ok.level != doctor.OK:
+            errors.append(f"代号一致应判 OK: {ubuntu_ok.level} {ubuntu_ok.detail[:40]}")
+        apt_mirror.sources_codenames = lambda: [
+            ("noble", "/etc/apt/sources.list.d/ubuntu.sources"),
+        ]
+        ubuntu_bad = _apt_codename_check()
+        if ubuntu_bad.level != doctor.WARN:
+            errors.append(f"Ubuntu 旧代号应判 WARN: {ubuntu_bad.level}")
+        # 源中无代号型 suite（固定词 / 自定义源）→ INFO 跳过
+        apt_mirror.sources_codenames = lambda: []
+        no_sources = _apt_codename_check()
+        if no_sources.level != doctor.INFO:
+            errors.append(f"无代号源应判 INFO: {no_sources.level}")
+        # 非 Ubuntu 系（Deepin suite 是固定词）→ INFO 跳过
+        doctor._read_os_release = lambda: {"NAME": "Deepin", "VERSION_CODENAME": "apricot"}
+        apt_mirror.sources_codenames = lambda: [
+            ("apricot", "/etc/apt/sources.list"),
+        ]
+        deepin_item = _apt_codename_check()
+        if deepin_item.level != doctor.INFO or "跳过" not in deepin_item.detail:
+            errors.append(f"Deepin 应跳过代号比对: {deepin_item.level}")
+        # 无 VERSION_CODENAME 的 Ubuntu（定制内核场景）→ INFO 不误报
+        doctor._read_os_release = lambda: {"NAME": "Ubuntu"}
+        no_codename = _apt_codename_check()
+        if no_codename.level != doctor.INFO:
+            errors.append(f"无系统代号应判 INFO: {no_codename.level}")
+        # 不可自动修复：改哪个源是用户的决定（且动作本身要提权）
+        for item in (mint_ok, mint_bad, ubuntu_ok, ubuntu_bad, no_sources, deepin_item):
+            if item.fixable:
+                errors.append(f"apt 代号项不应自动修复: {item.key}")
+        if build_fix_steps("apt_codename", report):
+            errors.append("apt_codename 不应生成修复步骤（应引导用户处理源）")
+    finally:
+        doctor._read_os_release = orig_release
+        apt_mirror.sources_codenames = orig_sources
+
+    # ---- v1.0.32：apt 源可用性体检（失效第三方源点名，官方源不给禁用指引） ----
+    from core import apt_health
+
+    # a) 解析：deb822 多 URI/多 suite + 传统行，http 之外跳过
+    deb822_entries = apt_health.parse_source_entries(
+        "Types: deb\n"
+        "URIs: http://archive.ubuntu.com/ubuntu/\n"
+        "Suites: noble noble-updates\n"
+        "Components: main universe\n",
+        path="/etc/apt/sources.list.d/ubuntu.sources",
+    )
+    if [(e.uri, e.suite) for e in deb822_entries] != [
+        ("http://archive.ubuntu.com/ubuntu", "noble"),
+        ("http://archive.ubuntu.com/ubuntu", "noble-updates"),
+    ]:
+        errors.append(f"deb822 解析异常: {[(e.uri, e.suite) for e in deb822_entries]}")
+    legacy_entries = apt_health.parse_source_entries(
+        "deb [arch=amd64] http://ppa.launchpadcontent.net/x/ubuntu/ jammy main\n"
+        "deb-src http://mirror.example.com/debian stable main\n"
+        "# deb http://commented.example.com noble main\n"
+        "deb file:/opt/local-repo ./ \n",
+        path="/etc/apt/sources.list",
+    )
+    if [(e.uri, e.suite) for e in legacy_entries] != [
+        ("http://ppa.launchpadcontent.net/x/ubuntu", "jammy"),
+        ("http://mirror.example.com/debian", "stable"),
+    ]:
+        errors.append(f"传统行解析异常（注释/file 应跳过）: {legacy_entries}")
+
+    # b) 分类：官方/第三方/未识别。未识别必须保守（不给禁用引导）
+    cases = [
+        ("http://archive.ubuntu.com/ubuntu", "noble", apt_health.KIND_OFFICIAL),
+        ("https://mirrors.aliyun.com/ubuntu", "noble", apt_health.KIND_OFFICIAL),
+        ("https://mirrors.aliyun.com/linuxmint-packages", "zena", apt_health.KIND_OFFICIAL),
+        ("http://packages.linuxmint.com", "zena", apt_health.KIND_OFFICIAL),
+        ("https://community-store-packages.deepin.com/deepin", "apricot", apt_health.KIND_OFFICIAL),
+        # 国内镜像主机上的第三方目录不能算官方
+        ("https://mirrors.aliyun.com/kubernetes", "core", apt_health.KIND_UNKNOWN),
+        ("https://ppa.launchpadcontent.net/x/ubuntu/", "jammy", apt_health.KIND_THIRD),
+        ("https://repo.steampowered.com/steam", "stable", apt_health.KIND_THIRD),
+        ("https://ci.deepin.com/repo/obs/linglong:/CI:/release/xUbuntu_24.04", "./", apt_health.KIND_THIRD),
+        ("https://unknown.example.com/repo", "noble", apt_health.KIND_UNKNOWN),
+    ]
+    for uri, suite, expect in cases:
+        entry = apt_health.SourceEntry(uri, suite, "main", "/tmp/x.list")
+        got = apt_health.classify(entry)
+        if got != expect:
+            errors.append(f"分类错误 {uri}: 应为 {expect}, 实为 {got}")
+
+    # c) 真机源文件解析不抛异常（dev 环境可能无源文件）
+    try:
+        real_entries = apt_health.read_source_entries()
+    except OSError as exc:
+        errors.append(f"read_source_entries 抛异常: {exc}")
+    else:
+        for entry in real_entries:
+            if not entry.uri.startswith(("http://", "https://")) or not entry.suite:
+                errors.append(f"源条目形状异常: {entry}")
+
+    # d) 注入假 prober 组装报告 + 体检行五态（不打网络）
+    def _fake_prober(ok_hosts: set[str]):
+        def _probe(uri: str, suite: str, timeout: float) -> tuple[bool, str]:
+            if any(h in uri for h in ok_hosts):
+                return True, ""
+            return False, "HTTP 404"
+
+        return _probe
+
+    orig_read = apt_health.read_source_entries
+    try:
+        apt_health.read_source_entries = lambda: [
+            apt_health.SourceEntry("http://archive.ubuntu.com/ubuntu", "noble", "main", "a"),
+            apt_health.SourceEntry("https://ppa.launchpadcontent.net/x/ubuntu/", "jammy", "main", "b"),
+            apt_health.SourceEntry("https://ci.deepin.com/repo/obs", "./", "", "c"),
+        ]
+        apt_health.check_health(prober=_fake_prober({"archive.ubuntu.com"}))
+        health_report = apt_health.check_health(prober=_fake_prober({"archive.ubuntu.com"}))
+        apt_health.store_report(health_report)
+        third_item = _apt_sources_check()
+        if third_item.level != doctor.WARN or "第三方" not in third_item.detail:
+            errors.append(f"第三方失效应判 WARN 并点名: {third_item.level} {third_item.detail[:50]}")
+        if "ppa.launchpadcontent.net" not in third_item.detail:
+            errors.append(f"WARN 详情应点名失效源: {third_item.detail[:60]}")
+        if "只禁第三方源" not in third_item.advice:
+            errors.append(f"第三方失效应给「只禁第三方源」指引: {third_item.advice[:50]}")
+        if third_item.fixable or build_fix_steps("apt_sources", report):
+            errors.append("apt 源可用性不应自动修复（禁用哪个源由用户决定）")
+        # 官方源失效：WARN 但绝不给禁用指引
+        apt_health.store_report(
+            apt_health.check_health(prober=_fake_prober({"ppa.launchpadcontent.net", "ci.deepin.com"}))
+        )
+        official_item = _apt_sources_check()
+        if official_item.level != doctor.WARN:
+            errors.append(f"官方源失效应判 WARN: {official_item.level}")
+        if "不要禁用" not in official_item.advice:
+            errors.append(f"官方源失效必须提示「不要禁用」: {official_item.advice[:50]}")
+        if "ppa" in official_item.detail:
+            errors.append(f"官方分支不应点名第三方源: {official_item.detail[:60]}")
+        # 全部可达 → OK
+        apt_health.store_report(
+            apt_health.check_health(prober=_fake_prober({"archive", "ppa", "ci.deepin"}))
+        )
+        ok_item = _apt_sources_check()
+        if ok_item.level != doctor.OK:
+            errors.append(f"全部可达应判 OK: {ok_item.level}")
+        # 无缓存 → INFO「尚未检测」；探测中 → INFO「检测中」
+        apt_health.abort_probing()
+        import core.apt_health as _ah
+        orig_cache, orig_probing = _ah._cache, _ah._probing
+        _ah._cache = None
+        _ah._probing = False
+        try:
+            none_item = _apt_sources_check()
+            if none_item.level != doctor.INFO or "尚未检测" not in none_item.detail:
+                errors.append(f"无缓存应判 INFO 尚未检测: {none_item.level}")
+            _ah._probing = True
+            probing_item = _apt_sources_check()
+            if probing_item.level != doctor.INFO or "探测" not in probing_item.detail:
+                errors.append(f"探测中应判 INFO: {probing_item.level}")
+        finally:
+            _ah._cache, _ah._probing = orig_cache, orig_probing
+        # 探测开关：测试模式可整体关闭自动探测
+        os.environ["RIME_INSTALLER_NO_SOURCE_PROBE"] = "1"
+        try:
+            if apt_health.probing_enabled():
+                errors.append("RIME_INSTALLER_NO_SOURCE_PROBE=1 时应关闭自动探测")
+        finally:
+            os.environ.pop("RIME_INSTALLER_NO_SOURCE_PROBE", None)
+    finally:
+        apt_health.read_source_entries = orig_read
+
     # ---- v1.0.26 审计修复回归 ----
     # a) 非 GNOME 桌面（DDE/KDE）用 ibus：不得误报「GNOME 输入源未添加」
     dde = _report_no_engine()
@@ -1237,6 +1716,54 @@ def check_doctor() -> list[str]:
                     )
             finally:
                 locked.chmod(0o755)
+
+    # ---- v1.0.29：Cinnamon（Linux Mint）输入源 ----
+    # Mint 的输入法面板就是 IBus 输入源，schema 为 org.cinnamon.desktop.input-sources；
+    # 旧实现只认 GNOME，Mint 上这一项永远「跳过」，用户「装了切不到」无人提示。
+    cinnamon = _report_no_engine()
+    cinnamon.os_name = "Linux Mint"
+    cinnamon.desktop = "X-Cinnamon"
+    cinnamon.engine_packages["ibus-rime"] = True
+    cinnamon.recommended_frontend = "ibus-rime"
+    cinnamon.active_frontend = "ibus-rime"
+    cinnamon.running_frontends = ["ibus-rime"]
+    orig_read = doctor._read_input_sources
+    try:
+        seen: list[str] = []
+
+        def _fake_read(schema: str) -> str | None:
+            seen.append(schema)
+            return "[('xkb', 'us')]"
+
+        doctor._read_input_sources = _fake_read  # type: ignore[assignment]
+        cin_item = {r.key: r for r in run_checks(cinnamon, [])}["input_source"]
+        if seen[:1] != ["org.cinnamon.desktop.input-sources"]:
+            errors.append(f"Cinnamon 应读 org.cinnamon.desktop.input-sources: {seen[:2]}")
+        if cin_item.level != "bad" or not cin_item.fixable:
+            errors.append(f"Cinnamon 未注册 rime 应判 bad 且可修复: {cin_item.level}")
+        cin_steps = build_fix_steps("input_source", cinnamon)
+        cin_cmd = " ".join(cin_steps[0].argv) if cin_steps else ""
+        if "org.cinnamon.desktop.input-sources" not in cin_cmd:
+            errors.append(f"Cinnamon 修复脚本应写 cinnamon schema: {cin_cmd[:120]}")
+        if "ibus-daemon" not in cin_cmd:
+            errors.append("Cinnamon 输入源修复后应重启 ibus")
+
+        doctor._read_input_sources = lambda schema: (  # type: ignore[assignment]
+            "[('xkb', 'us'), ('ibus', 'rime')]"
+        )
+        cin_ok = {r.key: r for r in run_checks(cinnamon, [])}["input_source"]
+        if cin_ok.level != "ok":
+            errors.append(f"Cinnamon 已注册 rime 应判 ok: {cin_ok.level} {cin_ok.detail[:40]}")
+
+        doctor._read_input_sources = lambda schema: None  # type: ignore[assignment]
+        cin_unread = {r.key: r for r in run_checks(cinnamon, [])}["input_source"]
+        if cin_unread.level != "info":
+            errors.append(f"Cinnamon 输入源读不到时应判 info（不猜）: {cin_unread.level}")
+        # 既不是「跳过」也不是「缺失」，建议须引导手动添加
+        if "手动添加" not in cin_unread.advice:
+            errors.append(f"读不到输入源时应引导手动添加: {cin_unread.advice[:40]}")
+    finally:
+        doctor._read_input_sources = orig_read  # type: ignore[assignment]
     return errors
 
 
@@ -1274,6 +1801,22 @@ def check_apt_mirror() -> list[str]:
                 errors.append("切换步骤应备份原源文件")
             if joined.count("pkexec") != 1:
                 errors.append(f"切换应只有一次 pkexec 提权: {joined}")
+            # v1.0.30：update 尽力而为——失效第三方源（404 / 缺公钥）不得把
+            # 「新源已写盘成功」的整步判失败（Mint 22.3 真机同款坑的镜像版）
+            if "||" not in joined:
+                errors.append("切换的 apt update 失败必须被容忍（缺 || 兜底）")
+            if "echo" not in joined:
+                errors.append("update 失败时应留警告日志")
+            upd_at = joined.find("apt-get update")
+            if upd_at < 0 or joined.find("||") < upd_at:
+                errors.append("容错分支必须包住 update（|| 应落在 update 之后）")
+            # 内层脚本 bash 语法检查（花括号容错组写错会整条命令崩）
+            inner = steps[0].argv[steps[0].argv.index("-c") + 1]
+            parsed = subprocess.run(
+                ["bash", "-n", "-c", inner], capture_output=True, text=True
+            )
+            if parsed.returncode != 0:
+                errors.append(f"切换脚本 bash 语法错误: {parsed.stderr.strip()[:160]}")
 
     # 并行测速对不可达地址必须返回 None 而非崩溃（TEST-NET-1 黑洞地址）
     probed = measure_mirror_latency(
@@ -1281,6 +1824,85 @@ def check_apt_mirror() -> list[str]:
     )
     if len(probed) != 1 or probed[0][1] is not None:
         errors.append(f"不可达镜像应返回 None: {probed}")
+    return errors
+
+
+def check_compat() -> list[str]:
+    """版本通配判定（v1.0.30）：parse_version / support_verdict / 无代号硬编码。"""
+    errors: list[str] = []
+
+    # ---- parse_version：正常形态逐段转 int，异常形态整体 None ----
+    for text, expected in (
+        ("24.04", (24, 4)),
+        ("22.3", (22, 3)),
+        ("25.2", (25, 2)),
+        ("23", (23,)),
+        ("24.04.1", (24, 4, 1)),
+        ("24.4", (24, 4)),  # 不强制补零
+    ):
+        got = compat.parse_version(text)
+        if got != expected:
+            errors.append(f"parse_version({text!r}) = {got}，期望 {expected}")
+    for bad in ("", "rolling", "abc", "24.x", " "):
+        if compat.parse_version(bad) is not None:
+            errors.append(f"parse_version({bad!r}) 应判不可解析")
+
+    # ---- support_verdict：家族 + 最低版本元组比较 ----
+    # 重点回归：*_future 用例——系统升级后的未来版本必须仍落入 OK。
+    # 这就是「通配」的核心语义：不为每个新版本加分支。
+    for name, version, expected in (
+        ("Ubuntu", "24.04", compat.OK),
+        ("Ubuntu", "26.04", compat.OK),
+        ("Ubuntu", "28.04", compat.OK),  # 未来版本
+        ("Ubuntu Kylin", "24.04", compat.OK),  # 官方衍生：NAME 子串命中
+        ("Ubuntu", "22.04", compat.BELOW),
+        ("Linux Mint", "22.3", compat.OK),
+        ("Linux Mint", "23", compat.OK),  # 未来版本
+        ("Linux Mint", "21", compat.BELOW),
+        ("Deepin", "25.2", compat.OK),
+        ("Deepin", "23", compat.BELOW),
+        ("UOS", "25.2", compat.OK),
+        ("Fedora", "40", compat.UNKNOWN),
+        ("Arch Linux", "", compat.UNKNOWN),  # 版本不可解析 → unknown
+        ("", "", compat.UNKNOWN),
+    ):
+        verdict = compat.support_verdict(name, version)
+        if verdict.state != expected:
+            errors.append(
+                f"support_verdict({name!r}, {version!r}) = {verdict.state}，期望 {expected}"
+            )
+
+    # unknown 判定不得带家族信息（UI 不显示「最低 XX」提示）
+    unknown = compat.support_verdict("Fedora", "40")
+    if unknown.family or unknown.minimum_text:
+        errors.append(f"unknown 判定不应带家族信息: {unknown}")
+    # minimum_text 随家族变化（提示文案引用它）
+    if compat.support_verdict("Ubuntu", "24.04").minimum_text != "Ubuntu 24.04":
+        errors.append("Ubuntu 的 minimum_text 异常")
+    if compat.support_verdict("Linux Mint", "22.3").minimum_text != "Linux Mint 22":
+        errors.append("Linux Mint 的 minimum_text 异常")
+
+    # ---- 结构性断言：compat.py 不得硬编码任何发行版代号 ----
+    # 认代号（noble/zena…）就等于把「通配」退化成「认版本」，违背本模块立意
+    source = (Path(__file__).resolve().parent / "core" / "compat.py").read_text(
+        encoding="utf-8"
+    )
+    for codename in ("noble", "jammy", "zena", "resolute", "plucky", "lunar"):
+        if codename in source.lower():
+            errors.append(f"compat.py 不应硬编码发行版代号: {codename}")
+    if len(compat.FAMILY_MIN) != 4:
+        errors.append(f"FAMILY_MIN 家族数量异常: {sorted(compat.FAMILY_MIN)}")
+
+    # ---- 判定摘要三态全覆盖且不得抛异常 ----
+    for state in (compat.OK, compat.BELOW, compat.UNKNOWN):
+        compat.verdict_line(
+            compat.Verdict(
+                state,
+                "" if state == compat.UNKNOWN else "ubuntu",
+                "",
+                None if state == compat.UNKNOWN else (24, 4),
+            )
+        )
     return errors
 
 
@@ -3573,6 +4195,7 @@ def check_i18n() -> list[str]:
                     errors.append(f"{source.name} 的 {name} 存在重复键: {dups}")
 
         # 主干键必须有英文翻译（导航与页面标题是用户第一眼看到的）
+        # v1.0.30：设置页「当前系统」列的版本通配文案同属用户可见主干
         for key in (
             *(f"nav.{n}" for n in (
                 "welcome", "engine", "scheme", "appearance", "backup", "doctor", "log", "settings"
@@ -3583,6 +4206,10 @@ def check_i18n() -> list[str]:
             *(f"{p}.subtitle" for p in (
                 "engine", "scheme", "appearance", "backup", "doctor", "log", "settings"
             )),
+            "settings.current_system",
+            "settings.support_ok",
+            "settings.support_below",
+            "settings.support_unknown",
         ):
             if key not in EN_TEXT:
                 errors.append(f"主干文案缺英文翻译: {key}")
@@ -3683,6 +4310,65 @@ def check_watchdog() -> list[str]:
     return errors
 
 
+def _check_worker_reap(window, app) -> list[str]:
+    """v1.0.33 回归：QThread 完成信号发在 run() 内部，槽收到时线程可能仍在
+    退出序列——提前丢引用会 ~QThread 撞 isRunning() → qFatal → SIGABRT(134)
+    （真机 Ubuntu 24.04 / Mint 22.3「点很多功能就闪退」根因）。验证两点：
+    ① 真实 _DetectWorker 跑完后，_on_detect_done 先等线程退出再清引用
+        （修复缺失时本进程会直接 134 猝死，全轮冒烟 FAIL）；
+    ② worker 在跑时关窗，closeEvent 先回收再放行（窗口销毁不再撞运行中线程）。
+    """
+    errors: list[str] = []
+    import time
+
+    from PyQt6.QtCore import QThread, pyqtSignal
+    from ui import main_window as mw_module
+
+    os.environ["RIME_INSTALLER_NO_SOURCE_PROBE"] = "1"
+    original_cls = mw_module._DetectWorker
+    try:
+        # ① 真实 worker：redetect_async → done 槽安全回收引用
+        window.redetect_async()
+        deadline = time.monotonic() + 30
+        while getattr(window, "_detect_worker", None) is not None:
+            if time.monotonic() > deadline:
+                errors.append("_DetectWorker 完成后未回收 _detect_worker 引用")
+                break
+            app.processEvents()
+            time.sleep(0.01)
+
+        # ② 关窗时 worker 仍在跑：慢速桩（run 内 sleep 后 emit，拉宽竞态窗口）
+        class _SlowDetectWorker(QThread):
+            done = pyqtSignal(object)
+
+            def run(self) -> None:
+                self.msleep(300)
+                self.done.emit(EnvReport())
+
+        mw_module._DetectWorker = _SlowDetectWorker
+        window.redetect_async()
+        app.processEvents()
+        if getattr(window, "_detect_worker", None) is None:
+            errors.append("慢速桩 worker 未启动（_detect_worker 为空）")
+        window.close()
+        app.processEvents()
+        worker = getattr(window, "_detect_worker", None)
+        if worker is not None and worker.isRunning():
+            errors.append("关窗后后台 worker 仍在运行（closeEvent 未回收）")
+        # 桩的 done 槽在关窗后仍会派发：等它把引用清掉
+        deadline = time.monotonic() + 10
+        while getattr(window, "_detect_worker", None) is not None:
+            if time.monotonic() > deadline:
+                errors.append("关窗后 _detect_worker 引用未回收")
+                break
+            app.processEvents()
+            time.sleep(0.01)
+    finally:
+        mw_module._DetectWorker = original_cls
+        os.environ.pop("RIME_INSTALLER_NO_SOURCE_PROBE", None)
+    return errors
+
+
 def check_window() -> list[str]:
     errors: list[str] = []
     from PyQt6.QtWidgets import QApplication
@@ -3692,11 +4378,16 @@ def check_window() -> list[str]:
     tmp_base = _tmp_dir("rime-window-")
     app = QApplication(sys.argv[:1])
     _APP_HOLDER.append(app)
+    # v1.0.32：窗口构建会触发体检页 bind → apt 源可用性后台探测（真实
+    # 网络 IO）。离屏冒烟环境关掉自动探测（行上显示「尚未检测」即可），
+    # 探测逻辑本身由 check_doctor 用注入 prober 覆盖。
     try:
+        os.environ["RIME_INSTALLER_NO_SOURCE_PROBE"] = "1"
         manifest = Manifest(tmp_base / "m.db", tmp_base / "snap")
         window = MainWindow(_report_with_engine(), manifest)
         window.show()
         app.processEvents()
+        os.environ.pop("RIME_INSTALLER_NO_SOURCE_PROBE", None)
 
         if config.APP_NAME not in window.windowTitle():
             errors.append(f"窗口标题异常: {window.windowTitle()}")
@@ -4124,16 +4815,19 @@ def check_window() -> list[str]:
         badge = settings.logo_badge
         if badge.source_path.name != "rime-installer-512.png":
             errors.append(f"设置页 Hero 应取 512 源图: {badge.source_path.name}")
-        hero_pixmap = badge.pixmap()
-        if hero_pixmap.isNull():
+        if badge.pixmap().isNull():
             errors.append("设置页 Hero 图标未渲染（pixmap 为空）")
-        elif badge.icon_size != 88 or hero_pixmap.width() < 176:
+        # v1.0.30：物理分辨率改断 last_pixmap（_render 的原始产物）。
+        # Qt 6.11 起 QLabel.pixmap() getter 会按控件 DPR 归一化（2.0 位图
+        # 往返后变 1.0、宽高减半），label 上的位图不再能反映超采样结果。
+        hero_pixmap = badge.last_pixmap
+        if hero_pixmap.isNull() or badge.icon_size != 88 or hero_pixmap.width() < 176:
             errors.append(
                 f"设置页 Hero 图标分辨率不足: size={badge.icon_size} "
                 f"pixmap={hero_pixmap.width()}x{hero_pixmap.height()}"
             )
         badge.set_icon_size(72)  # 窄窗口档：同样从 512 重采样，不是缩放大图
-        small_pixmap = badge.pixmap()
+        small_pixmap = badge.last_pixmap
         if small_pixmap.isNull() or small_pixmap.width() < 144:
             errors.append(f"Hero 图标 72 档重采样失败: {small_pixmap.width()}")
         badge.set_icon_size(88)
@@ -4490,6 +5184,9 @@ def check_window() -> list[str]:
             )
         no_dir_window.close()
 
+        # ---- v1.0.33：后台 worker 引用回收回归（真机闪退根因） ----
+        errors.extend(_check_worker_reap(window, app))
+
         window.redetect()
         app.processEvents()
         # v1.0.5：窗口级工具提示已删除（悬停弹「状态：…」长条属干扰），
@@ -4522,7 +5219,7 @@ def main() -> int:
 
     failures += check_resources()
 
-    assert config.VERSION == "1.0.28", "版本号与执行计划不一致"
+    assert config.VERSION == "1.0.35", "版本号与执行计划不一致"
     config.ensure_user_dirs()
     for d in (
         config.USER_DATA_DIR,
@@ -4537,6 +5234,7 @@ def main() -> int:
         failures.append(f"快照 CLI 缺失: {config.SNAPSHOT_CLI}")
 
     failures += check_detector()
+    failures += check_frontend_consistency()
     failures += check_platform()
     failures += check_state_machine()
 
@@ -4548,6 +5246,7 @@ def main() -> int:
         ("scheme_service", check_scheme_service),
         ("doctor", check_doctor),
         ("apt_mirror", check_apt_mirror),
+        ("compat", check_compat),
         ("theme", check_theme),
         ("launch_marker", check_launch_marker),
         ("launcher_script", check_launcher_script),
@@ -4588,7 +5287,7 @@ def main() -> int:
         return 1
     print(
         f"SMOKE OK — {config.APP_NAME} v{config.VERSION} "
-        "资源/检测/平台回退+GL渲染决策/状态机/日志/引擎装卸/方案装卸/manifest/快照备份/环境体检/apt镜像/部署引导/深浅色主题/启动标记/launcher重试链/deb依赖/动效/i18n/窗口验证通过"
+        "资源/检测/平台回退+GL渲染决策/状态机/日志/引擎装卸/方案装卸/manifest/快照备份/环境体检/apt镜像/apt源代号/apt源可用性/版本通配/部署引导/深浅色主题/启动标记/launcher重试链/deb依赖/动效/i18n/窗口验证通过"
         "（含皮肤装卸/切换/默认、fcitx5主题切换+自动重启生效+ibus外观项切换与还原）"
     )
     return 0

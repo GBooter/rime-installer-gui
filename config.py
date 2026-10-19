@@ -14,10 +14,14 @@ from pathlib import Path
 APP_NAME = "中州韵输入法安装器"
 APP_NAME_EN = "RIME Installer"
 APP_ID = "rime-installer"
-VERSION = "1.0.28"
+VERSION = "1.0.35"
 AUTHOR = "Feelup"
-# 适用系统：已知最低版本 + 显示服务端（X11 / Wayland），详见 doctor 平台探测
-SUPPORTED_SYSTEMS = "Ubuntu 26.04+ / Deepin 25.2+（X11 / Wayland）"
+# 适用系统：实测最低版本 + 显示服务端（X11 / Wayland）。
+# v1.0.30：改为**区间式**（下限定死、上沿不封顶）——版本通配判定见
+# core/compat.py（家族 + 最低版本元组比较，不枚举具体版本），用户系统
+# 升级到更高版本（Ubuntu 26.04 之后、Mint 23 等）无需改代码即自动落入
+# 支持区间；具体「当前系统是否受支持」由设置页按运行时探测结果展示。
+SUPPORTED_SYSTEMS = "Ubuntu 24.04 及以上 / Linux Mint 22 及以上 / Deepin 25.2 及以上（X11 / Wayland）"
 
 
 def _project_root() -> Path:
@@ -140,6 +144,22 @@ ENGINE_PACKAGES = {
     "ibus-rime": "ibus-rime",
     "fcitx5-rime": "fcitx5-rime",
     "fcitx-rime": "fcitx-rime",
+}
+# rime_deployer 所属包（v1.0.29）：Ubuntu 24.04/26.04 的 ibus-rime / fcitx5-rime
+# **都不依赖** librime-bin（包依赖与文件清单已核），缺它时「重新部署」只能退回
+# 「重启框架 + 轮询」，成功率低。安装引擎时顺手装上（best-effort，装不上不判失败）。
+ENGINE_DEPLOYER_PACKAGE = "librime-bin"
+
+# 各前端的「顺手安装」附加包（v1.0.35）。目前只有 fcitx4 需要：
+# 图形配置工具 fcitx-config-gtk（提供 /usr/bin/fcitx-configtool）**不在**
+# fcitx-rime 的依赖链里（其 Recommends 只有 fcitx 守护进程本身，包依赖已核），
+# 缺它时「打开配置工具」按钮静默失败——而 fcitx4 添加/上移输入法全靠这个 GUI
+# （体检对 fcitx4 只给引导、无一键修复，v1.0.8 决策）。
+# fcitx5 无此问题：fcitx5-configtool 由 fcitx5 包的 Recommends
+# （fcitx5-config-qt）默认随装；ibus-setup 由 ibus 包提供。
+# 安装引擎时 best-effort 一并装上（装不上只警告，不判任务失败）。
+FRONTEND_EXTRA_PACKAGES = {
+    "fcitx-rime": ["fcitx-config-gtk"],
 }
 
 # apt 国内镜像（F13：测速与切换）

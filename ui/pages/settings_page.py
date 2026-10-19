@@ -52,10 +52,10 @@ from qfluentwidgets import (
     isDarkTheme,
 )
 
-from core import apt_mirror, i18n, theme
+from core import apt_mirror, compat, i18n, theme
 from core.detector import EnvReport
 from core.state_machine import StateMachine
-from ui.pages.base import STATUS_COLORS, PageBase
+from ui.pages.base import STATUS_COLORS, PageBase, reap_worker
 
 #: 自绘元素（芯片 / 分隔线 / Hero 底色文字）的两套取色。qfluentwidgets 的
 #: 标准控件自己会跟随主题，只有这几类需要我们手动刷。
@@ -108,6 +108,7 @@ class _IconBadge(QLabel):
     def __init__(self, size: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._size = size
+        self._rendered = QPixmap()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFixedSize(size + self.PAD * 2, size + self.PAD * 2)
         self._shadow = QGraphicsDropShadowEffect(self)
@@ -125,6 +126,17 @@ class _IconBadge(QLabel):
     def source_path(self) -> Path:
         """实际使用的源图（smoke_test 用它断言取的是 512 档）。"""
         return self._pick_source()
+
+    @property
+    def last_pixmap(self) -> QPixmap:
+        """最近一次 _render 交给 setPixmap 的位图（smoke_test 断言物理分辨率用）。
+
+        v1.0.30：不能改用 `self.pixmap()` 断言——Qt 6.11 起 QLabel 的
+        pixmap() getter 会按控件自身 DPR 归一化后返回（2.0 的位图经过
+        setPixmap()/pixmap() 往返变成 1.0、宽高减半），而本标签的超采样
+        正是在这张 176 物理像素的位图里。这里原样保留渲染产物。
+        """
+        return self._rendered
 
     @staticmethod
     def _pick_source() -> Path:
@@ -146,14 +158,17 @@ class _IconBadge(QLabel):
         icon = QIcon(str(source)) if source.is_file() else QIcon()
         if icon.isNull():
             # 源图缺失（开发期漏拷 / 异常安装）：清空 pixmap，不抛异常也不留旧图
+            self._rendered = QPixmap()
             self.setPixmap(QPixmap())
             return
         dpr = max(2.0, float(self.devicePixelRatioF()))
         pixmap = icon.pixmap(QSize(self._size, self._size), dpr)
         if pixmap.isNull():
+            self._rendered = QPixmap()
             self.setPixmap(QPixmap())
             return
         pixmap.setDevicePixelRatio(dpr)
+        self._rendered = pixmap
         self.setPixmap(pixmap)
 
     def set_icon_size(self, size: int) -> None:
@@ -313,10 +328,15 @@ class SettingsPage(PageBase):
         self.frontend_value = BodyLabel("—")
         self.author_value = BodyLabel(config.AUTHOR)
         self.supported_value = _ElidedLabel(config.SUPPORTED_SYSTEMS)
+        # v1.0.30：「当前系统」列——运行时探测 + 版本通配判定（core/compat）。
+        # 与写死的「适用系统」互补：未来系统升级后这里自动显示实际版本与
+        # 判定结果，不再需要为新版本改代码。
+        self.current_system_value = _ElidedLabel("—")
         for key, i18n_key, value_widget, stretch in (
             ("frontend", "settings.frontend", self.frontend_value, 2),
             ("author", "settings.author", self.author_value, 2),
-            ("supported", "settings.supported_systems", self.supported_value, 5),
+            ("supported", "settings.supported_systems", self.supported_value, 3),
+            ("current_system", "settings.current_system", self.current_system_value, 3),
         ):
             column = QVBoxLayout()
             column.setSpacing(2)
@@ -467,6 +487,24 @@ class SettingsPage(PageBase):
     def _tagline_text(self) -> str:
         return f"{config.APP_NAME_EN} · {i18n.tr('settings.tagline')}"
 
+    def _current_system_text(self, report: EnvReport) -> str:
+        """「当前系统」列文案：运行时探测版本 + 版本通配判定（v1.0.30）。
+
+        与写死的「适用系统」互补：系统升级（乃至未来的 28.04 / Mint 23）
+        后这里自动显示实际版本与判定结果，无需为新版本改任何代码。
+        """
+        name = (report.os_name or "").strip() or "Linux"
+        version = (report.os_version or "").strip()
+        shown = f"{name} {version}".strip()
+        verdict = compat.support_verdict(report.os_name, report.os_version)
+        if verdict.state == compat.OK:
+            note = i18n.tr("settings.support_ok", minimum=verdict.minimum_text)
+        elif verdict.state == compat.BELOW:
+            note = i18n.tr("settings.support_below", minimum=verdict.minimum_text)
+        else:
+            note = i18n.tr("settings.support_unknown")
+        return f"{shown} · {note}"
+
     def _fill_theme_items(self) -> None:
         """重建主题下拉：跟随系统时把实际生效的明暗写进文案。"""
         current = theme.load_preference()
@@ -503,11 +541,17 @@ class SettingsPage(PageBase):
             self.mirror_note,
         ):
             widget.setStyleSheet(f"color: {muted};")
-        for widget in (self.frontend_value, self.author_value, self.supported_value):
+        for widget in (
+            self.frontend_value,
+            self.author_value,
+            self.supported_value,
+            self.current_system_value,
+        ):
             widget.setStyleSheet(f"color: {pal['text']};")
 
         self.frontend_value.setText(report.recommended_frontend or "—")
         self.supported_value.set_full_text(config.SUPPORTED_SYSTEMS)
+        self.current_system_value.set_full_text(self._current_system_text(report))
         self._fill_theme_items()
 
         supported = "ubuntu" in (report.os_name or "").lower()
@@ -623,11 +667,25 @@ class SettingsPage(PageBase):
         self._worker.start()
 
     def _on_speedtest_done(self, results: list) -> None:
+        # v1.0.33：results_ready 在 run() 内发出，槽收到时线程可能仍在退出
+        # 序列（isRunning() 仍为真）——直接清引用会 ~QThread → qFatal →
+        # SIGABRT(134)（真机闪退根因，见 base.reap_worker）。先等线程真正
+        # 退出再清引用；正常路径毫秒级。
+        if reap_worker(self._worker):
+            self._worker = None
         self._testing = False
         self._latencies = {name: seconds for name, seconds in results}
         self.speedtest_button.setText(i18n.tr("settings.speedtest"))
         self.speedtest_button.setEnabled(self._sm.rule("switch_mirror").enabled)
         self._reload_mirrors()
+
+    def shutdown_workers(self) -> None:
+        """v1.0.33：窗口关闭前回收测速线程（主窗口 closeEvent 调用）。
+
+        关窗会销毁页面、丢掉 worker 最后一个引用；线程若还在跑，
+        ~QThread 撞 isRunning() → SIGABRT(134)。有界等待后放行。
+        """
+        reap_worker(self._worker, 10_000)
 
     def _on_switch_clicked(self) -> None:
         mirror = self._selected_mirror()

@@ -112,6 +112,12 @@ ZH_TEXT = {
     "settings.version": "版本",
     "settings.author": "作者",
     "settings.supported_systems": "适用系统",
+    # v1.0.30：版本通配（core/compat.py）——「当前系统」列按运行时探测
+    # 显示 os_name + os_version + 判定结果，不再依赖写死的支持列表
+    "settings.current_system": "当前系统",
+    "settings.support_ok": "支持（{minimum} 及以上）",
+    "settings.support_below": "低于实测基线（最低 {minimum}），不保证可用",
+    "settings.support_unknown": "未识别的发行版，按通用 Linux 处理",
     "settings.about": "关于",
     # v1.0.28：三段式改版（Hero 高清图标 + 界面与外观 + apt 镜像）
     "settings.tagline": "基于 RIME / plum / aria2",
@@ -122,10 +128,11 @@ ZH_TEXT = {
     "settings.mirror_hint": (
         "切换镜像会备份原源文件（同目录 .rime-backup）并执行 apt update；"
         "Deepin 官方源位于国内，通常无需切换。"
+        "Linux Mint 的源由 mint 自带工具管理，本页只做展示。"
     ),
     "settings.mirror_note": (
-        "当前系统为 {os}，非 Ubuntu：apt 镜像切换不可用"
-        "（Deepin 官方源位于国内，通常无需切换）。"
+        "当前系统为 {os}：此页不提供镜像切换"
+        "（Deepin 官方源位于国内，通常无需切换；Linux Mint 的源由 mint 自带工具管理）。"
     ),
     "settings.speedtest": "测速",
     "settings.speedtesting": "测速中…",
@@ -411,7 +418,21 @@ ZH_TEXT = {
     "msg.backup_imported_body": "{name}（{count} 个文件）",
     "msg.delete_failed_hint": "只允许删除本安装器备份目录中的 .zip 文件",
     "msg.engine_installed": "引擎安装完成",
-    "msg.engine_install_hint": "{pkg} 已安装，可以前往「方案市场」安装输入法方案",
+    # v1.0.34：补上「加入输入源」这一步——真机反馈装完找不到输入法选项，
+    # 根因是输入源没注册（与 InfoBar 上的「去环境体检」按钮配套）
+    "msg.engine_install_hint": (
+        "{pkg} 已安装。可前往「方案市场」安装输入法方案，并到「环境体检」页"
+        "把「中文(Rime)」加入输入源——不加入则切换不到 Rime"
+    ),
+    "msg.goto_doctor": "去环境体检",
+    # v1.0.29：apt update 改为尽力而为后，install 失败才会走到这里
+    "msg.engine_install_failed": "引擎安装失败",
+    "msg.engine_install_failed_hint": (
+        "apt 没能装上引擎。最常见的原因是软件源里有已失效的第三方仓库"
+        "（报 404 或缺公钥），其次是没启用 universe 组件、或网络不通。"
+        "软件源索引更新失败已被自动忽略，不再是阻断原因；"
+        "详情见「日志」页，修好软件源后可直接重试。"
+    ),
     "msg.op_done": "操作完成",
     "msg.restart_framework": "重启输入法框架",
     "msg.framework_hint": "输入法框架已处理，如输入无候选请稍候片刻待 rime 自动部署",

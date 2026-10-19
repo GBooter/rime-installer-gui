@@ -1,9 +1,9 @@
 # 中州韵输入法安装器（RIME Installer）
 
-一款面向 **Ubuntu / Deepin** 的 RIME（中州韵）图形化安装与管理工具。把「装引擎、装方案、配环境、换皮肤、备份恢复、干净卸载」这条原本全靠命令行的链路，收进一个 PyQt6 + Fluent 风格的单窗口程序里。
+一款面向 **Ubuntu / Linux Mint / Deepin** 的 RIME（中州韵）图形化安装与管理工具。把「装引擎、装方案、配环境、换皮肤、备份恢复、干净卸载」这条原本全靠命令行的链路，收进一个 PyQt6 + Fluent 风格的单窗口程序里。
 
-![version](https://img.shields.io/badge/version-1.0.28-blue)
-![platform](https://img.shields.io/badge/platform-Ubuntu%2026.04%2B%20%7C%20Deepin%2025.2%2B-2ea44f)
+![version](https://img.shields.io/badge/version-1.0.35-blue)
+![platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B%20%7C%20Mint%2022%2B%20%7C%20Deepin%2025.2%2B-2ea44f)
 ![display](https://img.shields.io/badge/display-X11%20%2F%20Wayland-9cf)
 ![license](https://img.shields.io/badge/license-GPL--3.0-orange)
 
@@ -69,6 +69,10 @@
 
 其中「写入登录配置」会把输入法环境变量写进 `~/.config/environment.d/`（Wayland/systemd）与 `~/.xsessionrc`（X11 登录会话）——这两个位置才真正被桌面会话读取，写 `~/.xprofile` 在 Ubuntu / Deepin 上并不生效。
 
+「apt 源代号」项会比对 apt 源里的发行代号与当前系统：系统升级后旧代号残留（曾用本程序切换过镜像、手工添加的第三方源、升级中断）会让 apt 装到旧版包——此时体检给出警示与处理指引。该项按运行时探测比对，不为任何具体版本写死逻辑。
+
+「apt 源可用性」项在后台逐个探测源的连通性，失效的第三方源（404 / 连接失败，如失效的 PPA、CI 仓库）会被逐一点名并给出手动禁用指引；**官方源不可达时只提示检查网络，任何情况下都不会建议你禁用系统官方源**。
+
 ### 干净卸载
 
 引擎走 `apt` 卸载；方案与主题引入的文件按安装清单逐条删除，被覆盖的原有配置从快照还原，不留残余。
@@ -83,7 +87,7 @@
 
 | 项目 | 要求 |
 | --- | --- |
-| 系统 | Ubuntu 26.04+ / Deepin 25.2+ |
+| 系统 | Ubuntu 24.04 及以上 / Linux Mint 22 及以上 / Deepin 25.2 及以上（按运行时探测判定，系统升级后自动跟随） |
 | 显示服务 | X11 或 Wayland（纯 Wayland 下自动切 xcb 兼容层） |
 | 输入法框架 | `ibus-rime` / `fcitx5-rime`（自动检测推荐，可手动切换） |
 | 运行时 | Python 3.11+、PyQt6（deb 的 `Depends` 已声明） |
@@ -169,7 +173,9 @@ REQUIREMENTS.md          需求、架构决策与逐版本变更记录
 
 - Linux 下 rime 配色方案的生效范围有限，主题切换主要改变候选窗外观与字体排版，而非 rime 自身的 `color_scheme`；
 - 引擎安装与软件源切换需要提权，会弹出密码框；
-- 仅适配 Ubuntu 26.04+ / Deepin 25.2+，更老版本的 Qt6 与 fcitx5 行为差异较大。
+- 已适配 Ubuntu 24.04 及以上 / Linux Mint 22 及以上 / Deepin 25.2 及以上；版本判定为「家族 + 最低版本」通配（见 `core/compat.py`），不枚举具体版本——系统升级到更高版本（含未来新 LTS）后无需升级本程序即可继续使用，实际判定结果见「设置 → 当前系统」。更老版本的 Qt6 与 fcitx5 行为差异较大，未经充分验证。
+- Linux Mint 的 apt 源由 mint 自带工具管理，本程序的「设置 → apt 镜像」在 Mint 上只做展示，需要换源请用 mint 的「软件源」；
+- 若系统里挂着已失效的第三方 apt 源（返回 404 或缺公钥），`apt update` 会失败——程序已自动忽略该错误继续安装，但建议在「软件源」里禁用它。
 
 ## 致谢
 

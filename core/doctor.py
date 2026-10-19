@@ -6,6 +6,8 @@
 - 引擎包未安装 / 未安装任何方案
 - 未部署（rime 用户目录无 build/，输入无候选）
 - 框架未设为默认（~/.xinputrc 未指向当前前端）
+- apt 源代号与系统不一致（v1.0.31：升级后旧代号残留，装到旧版包）
+- apt 源可用性（v1.0.32：失效第三方源点名 + 手动禁用引导，官方源不禁）
 
 修复策略：可自动执行的生成 Step 列表（写输入法环境变量配置、启动框架、
 重新部署等），不可自动修复的（如未装引擎）给出跳转引导，由 UI 层处理。
@@ -23,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core import im_env
+from core import apt_health, apt_mirror, im_env
 from core.deploy_guide import build_deploy_script
 from core.detector import EnvReport
 from core.runner import Step
@@ -64,24 +66,33 @@ def _frontend_start_cmd(frontend: str) -> str:
     return "pkill -x fcitx 2>/dev/null; sleep 0.3; setsid fcitx -d >/dev/null 2>&1 &"
 
 
-def _gnome_input_sources(desktop: str = "") -> str | None:
-    """读取 GNOME 输入源配置；不可用（非 GNOME / 无 gsettings）返回 None。
+#: 用「gsettings 输入源」管理的桌面 → (桌面匹配关键字, schema, 展示名)
+#: v1.0.29：Cinnamon（Linux Mint）与 GNOME 同构——Cinnamon 的输入法面板就是
+#: IBus 的输入源列表，schema 为 org.cinnamon.desktop.input-sources，条目格式
+#: 也是 ('ibus','rime')。旧实现只认 GNOME，Mint 上这一整项永远「跳过」。
+INPUT_SOURCE_SCHEMAS = (
+    ("GNOME", "org.gnome.desktop.input-sources", "GNOME"),
+    ("CINNAMON", "org.cinnamon.desktop.input-sources", "Cinnamon"),
+    ("MINT", "org.cinnamon.desktop.input-sources", "Cinnamon"),
+)
 
-    GNOME Wayland 会话下，ibus-setup 的「输入法」列表不等于桌面输入源——
-    必须在 org.gnome.desktop.input-sources sources 里注册 ('ibus','rime')
-    才能从顶栏切换到 Rime（真机实证：preload 有 rime 但无法切换使用）。
 
-    v1.0.26：必须先判桌面。`gsettings` 在 DDE/KDE 上也存在且返回
-    `@a(ss) []`（exit 0），旧实现因此把「Deepin/KDE + ibus」误报成
-    「GNOME 输入源未添加」，修复动作还会去写一批没人读的键。
-    """
+def input_source_schema(desktop: str = "") -> tuple[str, str] | None:
+    """桌面 → (gsettings schema, 展示名)；不用 gsettings 管输入源的桌面返回 None。"""
+    upper = (desktop or "").upper()
+    for token, schema, label in INPUT_SOURCE_SCHEMAS:
+        if token in upper:
+            return schema, label
+    return None
+
+
+def _read_input_sources(schema: str) -> str | None:
+    """读取某个 gsettings schema 的 sources 值；不可用（无 gsettings/无 schema）返回 None。"""
     import subprocess
 
-    if "GNOME" not in (desktop or "").upper():
-        return None
     try:
         proc = subprocess.run(
-            ["gsettings", "get", "org.gnome.desktop.input-sources", "sources"],
+            ["gsettings", "get", schema, "sources"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -91,6 +102,25 @@ def _gnome_input_sources(desktop: str = "") -> str | None:
     if proc.returncode != 0:
         return None
     return proc.stdout.strip()
+
+
+def _gnome_input_sources(desktop: str = "") -> str | None:
+    """读取桌面的输入法输入源配置；不可用（非 GNOME/Cinnamon / 无 gsettings）返回 None。
+
+    GNOME Wayland 会话下，ibus-setup 的「输入法」列表不等于桌面输入源——
+    必须在 org.gnome.desktop.input-sources sources 里注册 ('ibus','rime')
+    才能从顶栏切换到 Rime（真机实证：preload 有 rime 但无法切换使用）。
+
+    v1.0.26：必须先判桌面。`gsettings` 在 DDE/KDE 上也存在且返回
+    `@a(ss) []`（exit 0），旧实现因此把「Deepin/KDE + ibus」误报成
+    「GNOME 输入源未添加」，修复动作还会去写一批没人读的键。
+
+    v1.0.29：Cinnamon 走同构的 org.cinnamon.desktop.input-sources。
+    """
+    resolved = input_source_schema(desktop)
+    if resolved is None:
+        return None
+    return _read_input_sources(resolved[0])
 
 
 def _fcitx5_input_methods(profile: Path | None = None) -> str | None:
@@ -135,10 +165,10 @@ def _fcitx5_input_methods(profile: Path | None = None) -> str | None:
     return ", ".join(unique)
 
 
-def _build_input_source_fix_script(frontend: str) -> str:
-    """把 ('ibus','rime') 合并进 GNOME 输入源（幂等）+ 重启框架。"""
+def _build_input_source_fix_script(frontend: str, schema: str = "org.gnome.desktop.input-sources") -> str:
+    """把 ('ibus','rime') 合并进桌面输入源（幂等）+ 重启框架。"""
     return (
-        "KEY=org.gnome.desktop.input-sources.sources\n"
+        f"KEY={schema}.sources\n"
         'CUR=$(gsettings get "$KEY" 2>/dev/null || echo "@a(ss) []")\n'
         'case "$CUR" in *"rime"*)\n'
         '  echo "输入源已包含 rime：$CUR"\n'
@@ -150,7 +180,7 @@ def _build_input_source_fix_script(frontend: str) -> str:
         "  else\n"
         "    NEW=\"${CUR%]}, ('ibus', 'rime')]\"\n"
         "  fi\n"
-        '  gsettings set "$KEY" "$NEW" && echo "已将 中文(Rime) 加入 GNOME 输入源"\n'
+        '  gsettings set "$KEY" "$NEW" && echo "已将 中文(Rime) 加入输入源"\n'
         ";; esac\n"
         + _frontend_start_cmd(frontend)
     )
@@ -197,6 +227,194 @@ def _has_schema(rime_dir: Path | None) -> bool:
         return False
 
 
+def _read_os_release() -> dict[str, str]:
+    """解析 /etc/os-release 为 dict（键去引号）；读不到返回空 dict。"""
+    try:
+        text = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    data: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        data[key.strip()] = value.strip().strip('"').strip("'")
+    return data
+
+
+def _apt_codename_check() -> CheckResult:
+    """v1.0.31：apt 源代号与运行时代号一致性——「系统升级后还能装」的探测。
+
+    背景：Ubuntu / Linux Mint 的 apt 源按**发行代号**（noble / zena）寻址，
+    do-release-upgrade / mintupgrade 正常会改写源；但三种情况会残留旧代号：
+    ①曾用本程序「apt 镜像」改写过的 ubuntu.sources（升级工具不重写它的
+    Suites 组合）；②手工添加的第三方源；③升级中断。表现为「升级后 apt
+    还能 update，但装到的全是旧版包」——引擎安装看起来成功，版本却不对。
+
+    探测用的代号全部运行时读取（os-release 的 VERSION_CODENAME + 源文件），
+    与 v1.0.30 compat 的通配思路一致：不为任何具体版本写死分支，
+    Ubuntu 28.04 / Mint 23 发布当天即可正确比对。
+
+    家族口径：Ubuntu 只认 ``VERSION_CODENAME``；Mint 额外放行
+    ``UBUNTU_CODENAME``——Mint 源同时引用自身代号与 Ubuntu 基座代号
+    （实测 zena + noble 并存），只认一个必然误报。Deepin 等非 Ubuntu 系
+    源的 suite 是固定词（deepin），不按代号寻址，直接跳过。
+    """
+    release = _read_os_release()
+    name = release.get("NAME", "").strip()
+    is_mint = "mint" in name.lower()
+    runtime = release.get("VERSION_CODENAME", "").strip().lower()
+    ubuntu_base = release.get("UBUNTU_CODENAME", "").strip().lower()
+    title = "apt 源代号"
+    if not (is_mint or name.lower() == "ubuntu"):
+        return CheckResult(
+            "apt_codename",
+            title,
+            INFO,
+            f"当前系统（{name or '未知'}）的 apt 源不按发行代号寻址，跳过",
+            "本项仅对 Ubuntu / Linux Mint 有意义",
+            i18n_key="doctor.check.apt_codename.non_ubuntu",
+            i18n_params={"os": name or "未知"},
+        )
+    allowed = ({runtime, ubuntu_base} if is_mint else {runtime}) - {""}
+    if not allowed:
+        return CheckResult(
+            "apt_codename",
+            title,
+            INFO,
+            "系统未提供发行代号（os-release 无 VERSION_CODENAME），无法比对",
+            "如为定制发行版，请手动核对 apt 源中的发行代号",
+            i18n_key="doctor.check.apt_codename.no_codename",
+        )
+    codenames = apt_mirror.sources_codenames()
+    if not codenames:
+        return CheckResult(
+            "apt_codename",
+            title,
+            INFO,
+            "未在 apt 源中检测到发行代号，跳过",
+            "使用固定词 suite（如 Debian stable）或自定义源时无需比对",
+            i18n_key="doctor.check.apt_codename.no_sources",
+        )
+    stale = sorted({c for c, _ in codenames if c not in allowed})
+    expected = "/".join(sorted(allowed))
+    if not stale:
+        return CheckResult(
+            "apt_codename",
+            title,
+            OK,
+            f"apt 源代号与当前系统一致（{expected}）",
+            i18n_key="doctor.check.apt_codename.ok",
+            i18n_params={"codename": expected},
+        )
+    stale_desc = "、".join(
+        f"{codename}（{Path(path).name}）"
+        for codename, path in codenames
+        if codename in stale
+    )
+    return CheckResult(
+        "apt_codename",
+        title,
+        WARN,
+        f"apt 源中存在与当前系统（{expected}）不一致的发行代号：{stale_desc}",
+        "系统升级后旧代号残留会让 apt 装到旧版包：请在「软件和更新 / 软件源」"
+        "中把这些源更新为当前代号或禁用；若曾用本程序切换镜像，重新切换一次"
+        "即可按当前代号重写",
+        i18n_key="doctor.check.apt_codename.mismatch",
+        i18n_params={"codename": expected, "stale": stale_desc},
+    )
+
+
+def _apt_sources_check() -> CheckResult:
+    """v1.0.32：apt 源可用性（读 apt_health 探测缓存，本函数无网络 IO）。
+
+    失效的第三方源会让 ``apt update`` 报错（404 / NO_PUBKEY / 连接失败），
+    引擎安装步骤的 update 已容错跳过，但残留的坏源会一直拖慢每次 apt 操作。
+    本项把它逐个点名，并给出手动禁用指引。
+
+    **安全边界**：只对「第三方」源给禁用指引；官方源（Ubuntu 官方 / 知名
+    镜像的 ubuntu 路径 / Mint / Deepin 官方）与未识别源不可达时，一律只提示
+    检查网络或自行确认——误引导用户禁用官方源是比漏报严重得多的失败。
+    """
+    title = "apt 源可用性"
+    report = apt_health.last_report()
+    if report is None:
+        if apt_health.is_probing():
+            return CheckResult(
+                "apt_sources",
+                title,
+                INFO,
+                "正在后台探测 apt 源可达性，请稍候（完成自动刷新）",
+                i18n_key="doctor.check.apt_sources.probing",
+            )
+        return CheckResult(
+            "apt_sources",
+            title,
+            INFO,
+            "尚未检测 apt 源可达性（打开本页时自动在后台探测）",
+            "失效的第三方源会让 apt update 报错；检测完成后本行自动刷新",
+            i18n_key="doctor.check.apt_sources.not_tested",
+        )
+    third = report.third_failed
+    official = report.official_failed + report.unknown_failed
+    if not third and not official:
+        if report.total == 0:
+            return CheckResult(
+                "apt_sources",
+                title,
+                INFO,
+                "未在系统中检测到 apt 源，跳过",
+                i18n_key="doctor.check.apt_sources.no_sources",
+            )
+        return CheckResult(
+            "apt_sources",
+            title,
+            OK,
+            f"{report.total} 个 apt 源全部可达",
+            i18n_key="doctor.check.apt_sources.ok",
+            i18n_params={"count": str(report.total)},
+        )
+
+    def _desc(items: list[tuple[apt_health.SourceEntry, str]]) -> str:
+        return "、".join(f"{entry.label}（{reason}）" for entry, reason in items)
+
+    if third:
+        # 第三方失效：点名 + 禁用指引（官方源自始至终不出现禁用话术）
+        detail = f"{len(third)} 个第三方 apt 源不可达：{_desc(third)}"
+        advice = (
+            "请在「软件和更新 / 软件源」中禁用它们（或把 sources.list.d 下对应"
+            "文件移出目录、注释掉其中 deb 行）——只禁第三方源，切勿禁用系统官方源"
+        )
+        if official:
+            detail += f"；另有 {len(official)} 个官方/未识别源不可达，通常是网络问题，请勿禁用"
+        return CheckResult(
+            "apt_sources",
+            title,
+            WARN,
+            detail,
+            advice,
+            i18n_key="doctor.check.apt_sources.third_failed",
+            i18n_params={
+                "count": str(len(third)),
+                "items": _desc(third),
+                "official": str(len(official)),
+            },
+        )
+    return CheckResult(
+        "apt_sources",
+        title,
+        WARN,
+        f"{len(official)} 个官方/未识别 apt 源不可达：{_desc(official)}",
+        "请检查网络连接或代理设置；未识别源请自行确认后再处理——"
+        "不要禁用系统官方源",
+        i18n_key="doctor.check.apt_sources.official_failed",
+        i18n_params={
+            "count": str(len(official)),
+            "items": _desc(official),
+        },
+    )
+
+
 def run_checks(report: EnvReport, installed_scheme_keys: list[str] | None = None) -> list[CheckResult]:
     """按当前环境报告执行全部体检项（纯计算，无副作用）。
 
@@ -204,8 +422,14 @@ def run_checks(report: EnvReport, installed_scheme_keys: list[str] | None = None
     `iterdir()` 在目录无读/执行权限时抛 PermissionError（3.12/3.13 实测），
     而本函数运行在 `bind()` → Qt 信号槽链里——未捕获异常会让 PyQt6 直接
     abort（无弹窗、无 traceback）。root 拥有过 rime 目录的用户必踩。
+
+    v1.0.34：frontend 取 `effective_frontend`（已装引擎锚定）。旧实现用
+    `active_frontend or recommended_frontend`，在 Mint 真机上翻车：装的是
+    ibus-rime，重开后 active 变 fcitx-rime，于是输入源注册检查走 fcitx
+    分支（只给文字建议）、Cinnamon 的 gsettings 一键修复从未触发，用户
+    「装完找不到中州韵输入法选项」。
     """
-    frontend = report.active_frontend or report.recommended_frontend
+    frontend = report.effective_frontend
     results: list[CheckResult] = []
 
     # 1. 输入法环境变量（v1.0.5：只报「已设定但冲突」，未设定按会话自动处理属正常）
@@ -464,51 +688,71 @@ def run_checks(report: EnvReport, installed_scheme_keys: list[str] | None = None
             )
         )
 
-    # 5.5 输入源注册（v1.0.6）：GNOME 会话必须显式把 Rime 加入输入源才能切换使用
+    # 5.5 输入源注册（v1.0.6）：GNOME/Cinnamon 会话必须显式把 Rime 加入输入源才能切换使用
     if frontend == "ibus-rime":
-        sources = _gnome_input_sources(report.desktop)
-        if sources is None:
+        resolved = input_source_schema(report.desktop)
+        sources = _read_input_sources(resolved[0]) if resolved else None
+        if resolved is None:
             desktop = report.desktop or "未知桌面"
             results.append(
                 CheckResult(
                     "input_source",
                     "输入源注册",
                     INFO,
-                    f"当前桌面（{desktop}）不使用 GNOME 输入源配置，跳过"
+                    f"当前桌面（{desktop}）不使用 GNOME/Cinnamon 输入源配置，跳过"
                     "（DDE/KDE 由桌面自带的输入法模块管理，gsettings 写了也不生效）",
                     "如切换不到 Rime，请到桌面「输入法」设置里添加「中文(Rime)」",
                     i18n_key="doctor.check.input_source.ibus_non_gnome",
                     i18n_params={"desktop": desktop},
                 )
             )
+        elif sources is None:
+            # v1.0.29：桌面认对了、但读不到配置（gsettings 缺失 / 系统未装该
+            # schema，如精简版 Mint）——此时既不报 BAD（无从判断）也不谎称跳过。
+            results.append(
+                CheckResult(
+                    "input_source",
+                    "输入源注册",
+                    INFO,
+                    f"未能读取 {resolved[1]} 输入源配置（gsettings 不可用或系统未提供"
+                    f" {resolved[0]}），无法判断",
+                    "如切换不到 Rime，请到桌面「键盘 → 输入法」里手动添加「中文(Rime)」",
+                    i18n_key="doctor.check.input_source.ibus_unreadable",
+                    i18n_params={"desktop": resolved[1], "schema": resolved[0]},
+                )
+            )
         elif re.search(r"\('ibus',\s*'rime'\)", sources):
+            label = resolved[1]
             results.append(
                 CheckResult(
                     "input_source",
                     "输入源注册",
                     OK,
-                    "GNOME 输入源已包含 中文(Rime)",
+                    f"{label} 输入源已包含 中文(Rime)",
                     i18n_key="doctor.check.input_source.ibus_ok",
+                    i18n_params={"desktop": label},
                 )
             )
         else:
-            # v1.0.26 第二步：ibus-rime 没装就不要往 GNOME 写一个指向空引擎的输入源
+            label = resolved[1]
+            # v1.0.26 第二步：ibus-rime 没装就不要往输入源里写一个指向空引擎的条目
             ibus_ready = report.engine_packages.get("ibus-rime", False)
             results.append(
                 CheckResult(
                     "input_source",
                     "输入源注册",
                     BAD,
-                    "GNOME 输入源未添加「中文(Rime)」——不添加则无法切换到 Rime"
-                    "（注意：ibus-setup 添加在 GNOME 会话下不生效）",
-                    "一键修复将把 中文(Rime) 写入 GNOME 输入源并重启 ibus；"
-                    "也可在 设置→键盘→输入源 手动添加"
+                    f"{label} 输入源未添加「中文(Rime)」——不添加则无法切换到 Rime"
+                    f"（注意：ibus-setup 添加在 {label} 会话下不生效）",
+                    "一键修复将把 中文(Rime) 写入桌面输入源并重启 ibus；"
+                    "也可在 系统设置 → 键盘 → 输入源 手动添加"
                     if ibus_ready
                     else "请先到「引擎安装」页安装 ibus-rime，再回来添加输入源",
                     fixable=ibus_ready,
                     i18n_key="doctor.check.input_source.ibus_missing"
                     if ibus_ready
                     else "doctor.check.input_source.ibus_no_engine",
+                    i18n_params={"desktop": label},
                 )
             )
 
@@ -559,7 +803,8 @@ def run_checks(report: EnvReport, installed_scheme_keys: list[str] | None = None
                 "输入法列表",
                 INFO,
                 "旧版 fcitx 的输入法列表需在图形配置中确认已添加 Rime",
-                "点本页「配置工具」打开 fcitx 配置 → 输入法标签页添加「Rime」",
+                "点本页「配置工具」打开 fcitx 配置 → 输入法标签页添加「Rime」"
+                "（若配置工具打不开：sudo apt install fcitx-config-gtk）",
                 i18n_key="doctor.check.input_source.fcitx_legacy",
             )
         )
@@ -697,12 +942,27 @@ def run_checks(report: EnvReport, installed_scheme_keys: list[str] | None = None
             )
         )
 
+    # 8. apt 源代号一致性（v1.0.31）：系统升级后旧代号残留的探测。
+    # 放在最后：它与 rime 本身无关，属于「升级后还能不能装」的基础设施检查；
+    # 不可自动修复（改哪个源是用户的决定），只给 WARN 与处理指引。
+    results.append(_apt_codename_check())
+
+    # 9. apt 源可用性（v1.0.32）：定位失效 / 不可达的第三方源。
+    # 探测本身有网络 IO，由体检页在 QThread 后台跑（run_checks 保持纯计算），
+    # 结果落 apt_health 模块缓存后由这里渲染。同样不可自动修复——只引导
+    # 用户手动禁用第三方源；官方源任何情况下都不给禁用指引。
+    results.append(_apt_sources_check())
+
     return results
 
 
 def build_fix_steps(key: str, report: EnvReport) -> list[Step]:
-    """构建某项体检的修复步骤（UI 层对 fixable 项调用；空列表表示不可自动修复）。"""
-    frontend = report.active_frontend or report.recommended_frontend
+    """构建某项体检的修复步骤（UI 层对 fixable 项调用；空列表表示不可自动修复）。
+
+    v1.0.34：frontend 与 run_checks 统一取 `effective_frontend`——修复动作
+    必须打在「实际装着的引擎」上，而不是某次启动环境的瞬时快照。
+    """
+    frontend = report.effective_frontend
     rime_dir = report.rime_user_dir
 
     if key == "im_env":
@@ -738,13 +998,15 @@ def build_fix_steps(key: str, report: EnvReport) -> list[Step]:
         ]
 
     if key == "input_source" and frontend == "ibus-rime":
-        # v1.0.26：非 GNOME 桌面不写 gsettings（写了也没人读，还会误报已修复）
-        if "GNOME" not in (report.desktop or "").upper():
+        # v1.0.26：非 GNOME/Cinnamon 桌面不写 gsettings（写了没人读，还会误报已修复）
+        resolved = input_source_schema(report.desktop)
+        if resolved is None:
             return []
+        schema, label = resolved
         return [
             Step(
-                "将 中文(Rime) 加入 GNOME 输入源并重启 ibus",
-                ["bash", "-c", _build_input_source_fix_script(frontend)],
+                f"将 中文(Rime) 加入 {label} 输入源并重启 ibus",
+                ["bash", "-c", _build_input_source_fix_script(frontend, schema)],
                 weight=1,
             )
         ]

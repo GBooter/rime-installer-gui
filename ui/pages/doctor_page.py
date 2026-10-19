@@ -13,7 +13,7 @@ objectName 相同时，NavigationPanel.insertItem 会静默丢弃本页导航项
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout
 
 from qfluentwidgets import (
@@ -25,15 +25,42 @@ from qfluentwidgets import (
 )
 
 from core.detector import EnvReport
-from core import i18n
+from core import apt_health, i18n
 from core.doctor import CheckResult, run_checks
 from core.state_machine import StateMachine
-from ui.pages.base import STATUS_COLORS, PageBase, ProgressAreaMixin
+from ui.pages.base import STATUS_COLORS, PageBase, ProgressAreaMixin, reap_worker
 
 _LEVEL_STATUS = {"ok": "ok", "warn": "warn", "bad": "bad", "info": "muted"}
 
 #: 标题列最小宽度（中文最长标题「默认输入法框架」约 100px，留余量）
 _TITLE_MIN = 132
+
+
+class AptHealthWorker(QThread):
+    """后台探测 apt 源可达性（urllib 并行，与镜像测速同款）。
+
+    v1.0.32：run_checks 必须保持纯计算（跑在 Qt 槽里，不能有网络 IO），
+    因此探测放在页面自己的 QThread 里，完成后写 apt_health 缓存并通知
+    页面刷新体检行。探测失败不影响任何东西——缓存留空即可。
+    """
+
+    finished_ok = pyqtSignal()
+
+    def __init__(self, timeout: float = apt_health.PROBE_TIMEOUT) -> None:
+        super().__init__()
+        self._timeout = timeout
+        self._failed = False
+
+    def run(self) -> None:
+        try:
+            apt_health.mark_probing()
+            report = apt_health.check_health(timeout=self._timeout)
+            apt_health.store_report(report)
+        except Exception:  # noqa: BLE001 — 探测异常绝不可冒泡到 Qt 事件循环
+            # 整体失败（解析异常等）：清探测中标志、缓存留空，
+            # 行上显示「尚未检测」——不漏报也不谎报
+            apt_health.abort_probing()
+        self.finished_ok.emit()
 
 
 def localized(result: CheckResult) -> tuple[str, str, str]:
@@ -127,6 +154,8 @@ class DoctorPage(ProgressAreaMixin, PageBase):
         self._installed_keys = set(installed_keys or ())
         self._results: list[CheckResult] = []
         self._rows: dict[str, CheckRow] = {}
+        # v1.0.32：apt 源可用性探测线程（bind 时按 TTL 触发，见 _maybe_probe_sources）
+        self._health_worker: AptHealthWorker | None = None
 
         self.summary_row = self.add_row(i18n.tr("doctor.overall"), "")
 
@@ -237,6 +266,42 @@ class DoctorPage(ProgressAreaMixin, PageBase):
         self._results = run_checks(report, sorted(self._installed_keys))
         self._rebuild_rows()
         self._fill(report, sm)
+        # v1.0.32：源可用性探测在后台线程跑（run_checks 无网络 IO），
+        # 缓存过期才重探——启动时全页面 bind 一次、之后 10 分钟内不重复。
+        self._maybe_probe_sources()
+
+    def _maybe_probe_sources(self) -> None:
+        """缓存过期且探测总开关打开时，起后台探测（测试模式可关）。"""
+        if self._health_worker is not None:
+            return  # 上一轮还在跑：等它完成，不重入
+        if not apt_health.probing_enabled() or not apt_health.is_stale():
+            return
+        worker = AptHealthWorker()
+        worker.finished_ok.connect(self._on_health_probed)
+        self._health_worker = worker
+        worker.start()
+
+    def _on_health_probed(self) -> None:
+        """探测完成：用新缓存重算体检行（保持摘要与按钮态一并刷新）。"""
+        # v1.0.33：finished_ok 在 run() 内发出，槽收到时线程可能仍在退出
+        # 序列（isRunning() 仍为真）——直接清引用会 ~QThread → qFatal →
+        # SIGABRT(134)（真机闪退根因，见 base.reap_worker）。先等线程真正
+        # 退出再清引用；正常路径毫秒级。
+        if reap_worker(self._health_worker):
+            self._health_worker = None
+        if self._report is None:
+            return
+        self._results = run_checks(self._report, sorted(self._installed_keys))
+        self._rebuild_rows()
+        self._fill(self._report, self._sm)
+
+    def shutdown_workers(self) -> None:
+        """v1.0.33：窗口关闭前回收探测线程（主窗口 closeEvent 调用）。
+
+        关窗会销毁页面、丢掉 worker 最后一个引用；线程若还在跑，
+        ~QThread 撞 isRunning() → SIGABRT(134)。有界等待后放行。
+        """
+        reap_worker(self._health_worker, 10_000)
 
     def _rebuild_rows(self) -> None:
         # 清空旧行。注意：CheckRow 是 QHBoxLayout，item.widget() 恒为 None——

@@ -101,6 +101,12 @@ EN_TEXT: dict[str, str] = {
     "settings.version": "Version",
     "settings.author": "Author",
     "settings.supported_systems": "Supported systems",
+    # v1.0.30: version-agnostic support (core/compat.py) — the "Current system"
+    # column shows os_name + os_version + verdict detected at runtime
+    "settings.current_system": "Current system",
+    "settings.support_ok": "Supported ({minimum} and later)",
+    "settings.support_below": "Below tested baseline (minimum {minimum}); not guaranteed",
+    "settings.support_unknown": "Unrecognized distro; treated as generic Linux",
     "settings.about": "About",
     # v1.0.28：three-section layout (hero icon + interface + apt mirror)
     "settings.tagline": "Built on RIME / plum / aria2",
@@ -114,8 +120,9 @@ EN_TEXT: dict[str, str] = {
         "are already in China, so switching is usually unnecessary."
     ),
     "settings.mirror_note": (
-        "This system is {os}, not Ubuntu: apt mirror switching is unavailable "
-        "(Deepin's official repositories are already in China)."
+        "This system is {os}: apt mirror switching is not offered here "
+        "(Deepin's repositories are already in China; Linux Mint manages its "
+        "sources with its own tool)."
     ),
     "settings.speedtest": "Speed test",
     "settings.speedtesting": "Testing…",
@@ -447,29 +454,37 @@ EN_TEXT: dict[str, str] = {
         "install librime-bin first"
     ),
     "doctor.check.input_source.ibus_non_gnome.detail": (
-        "This desktop ({desktop}) does not use GNOME input sources; skipped "
-        "(DDE/KDE manage IMEs themselves, gsettings has no effect)"
+        "This desktop ({desktop}) does not use GNOME/Cinnamon input sources; "
+        "skipped (DDE/KDE manage IMEs themselves, gsettings has no effect)"
     ),
     "doctor.check.input_source.ibus_non_gnome.advice": (
         "If you cannot switch to RIME, add “Chinese (Rime)” in the desktop's "
         "own input method settings"
     ),
+    "doctor.check.input_source.ibus_unreadable.detail": (
+        "Could not read the {desktop} input-source configuration (gsettings "
+        "unavailable or {schema} missing), so this cannot be judged"
+    ),
+    "doctor.check.input_source.ibus_unreadable.advice": (
+        "If you cannot switch to RIME, add “Chinese (Rime)” manually under "
+        "Keyboard → Input Sources in your desktop settings"
+    ),
     "doctor.check.input_source.ibus_ok.detail": (
-        "GNOME input sources already include Chinese (Rime)"
+        "{desktop} input sources already include Chinese (Rime)"
     ),
     "doctor.check.input_source.ibus_missing.detail": (
-        "GNOME input sources do not include “Chinese (Rime)” — RIME cannot be "
-        "selected without it (note: adding it via ibus-setup has no effect in "
-        "a GNOME session)"
+        "{desktop} input sources do not include “Chinese (Rime)” — RIME cannot "
+        "be selected without it (note: adding it via ibus-setup has no effect "
+        "in a {desktop} session)"
     ),
     "doctor.check.input_source.ibus_missing.advice": (
-        "Auto-fix adds Chinese (Rime) to GNOME input sources and restarts ibus; "
-        "you can also add it under Settings → Keyboard → Input Sources"
+        "Auto-fix adds Chinese (Rime) to the desktop input sources and restarts "
+        "ibus; you can also add it under Settings → Keyboard → Input Sources"
     ),
     "doctor.check.input_source.ibus_no_engine.detail": (
-        "GNOME input sources do not include “Chinese (Rime)” — RIME cannot be "
-        "selected without it (note: adding it via ibus-setup has no effect in "
-        "a GNOME session)"
+        "{desktop} input sources do not include “Chinese (Rime)” — RIME cannot "
+        "be selected without it (note: adding it via ibus-setup has no effect "
+        "in a {desktop} session)"
     ),
     "doctor.check.input_source.ibus_no_engine.advice": (
         "Install ibus-rime on the Engine page first, then add the input source"
@@ -495,6 +510,7 @@ EN_TEXT: dict[str, str] = {
     ),
     "doctor.check.input_source.fcitx_legacy.advice": (
         "Click “Config tool” on this page → Input Method tab → add “Rime”"
+        " (if the tool won't open: sudo apt install fcitx-config-gtk)"
     ),
     "doctor.check.autostart.session_managed.detail": (
         "The framework is started automatically by the desktop session; "
@@ -538,6 +554,74 @@ EN_TEXT: dict[str, str] = {
     ),
     "doctor.check.rime_dir.absent.advice": (
         "RIME creates this directory after a scheme is installed"
+    ),
+    "doctor.check.apt_codename.title": "apt source codename",
+    "doctor.check.apt_codename.non_ubuntu.detail": (
+        "This system ({os}) does not address apt sources by release codename; "
+        "skipped"
+    ),
+    "doctor.check.apt_codename.non_ubuntu.advice": (
+        "This check is only meaningful on Ubuntu / Linux Mint"
+    ),
+    "doctor.check.apt_codename.no_codename.detail": (
+        "The system provides no release codename (no VERSION_CODENAME in "
+        "os-release); cannot compare"
+    ),
+    "doctor.check.apt_codename.no_codename.advice": (
+        "On a custom distro, verify the codenames in your apt sources manually"
+    ),
+    "doctor.check.apt_codename.no_sources.detail": (
+        "No release codename found in apt sources; skipped"
+    ),
+    "doctor.check.apt_codename.no_sources.advice": (
+        "Nothing to compare for fixed-word suites (e.g. Debian stable) or "
+        "custom sources"
+    ),
+    "doctor.check.apt_codename.ok.detail": (
+        "apt source codenames match the current system ({codename})"
+    ),
+    "doctor.check.apt_codename.mismatch.detail": (
+        "apt sources contain codenames that do not match the current system "
+        "({codename}): {stale}"
+    ),
+    "doctor.check.apt_codename.mismatch.advice": (
+        "Leftover codenames after a system upgrade make apt install old "
+        "packages: update or disable these sources in “Software & Updates”; "
+        "if you switched mirrors with this app, switch once more to rewrite "
+        "them with the current codename"
+    ),
+    "doctor.check.apt_sources.title": "apt source reachability",
+    "doctor.check.apt_sources.probing.detail": (
+        "Probing apt source reachability in the background, please wait "
+        "(this row refreshes automatically)"
+    ),
+    "doctor.check.apt_sources.not_tested.detail": (
+        "apt source reachability has not been tested yet (probed "
+        "automatically in the background when this page opens)"
+    ),
+    "doctor.check.apt_sources.not_tested.advice": (
+        "Broken third-party sources make apt update fail; this row refreshes "
+        "once the probe finishes"
+    ),
+    "doctor.check.apt_sources.no_sources.detail": (
+        "No apt sources found on this system; skipped"
+    ),
+    "doctor.check.apt_sources.ok.detail": "All {count} apt sources are reachable",
+    "doctor.check.apt_sources.third_failed.detail": (
+        "{count} third-party apt sources are unreachable: {items}"
+    ),
+    "doctor.check.apt_sources.third_failed.advice": (
+        "Disable them in “Software & Updates” (or move the matching file out "
+        "of sources.list.d, or comment out its deb lines) — disable "
+        "third-party sources only, never the official system sources"
+    ),
+    "doctor.check.apt_sources.official_failed.detail": (
+        "{count} official/unrecognized apt sources are unreachable: {items}"
+    ),
+    "doctor.check.apt_sources.official_failed.advice": (
+        "Check your network connection or proxy settings; for unrecognized "
+        "sources, confirm them yourself before acting — do not disable the "
+        "official system sources"
     ),
     # ---- 备份页 ----
     "backup.note_placeholder": "Note (optional), e.g. “before installing rime-ice”",
@@ -656,7 +740,18 @@ EN_TEXT: dict[str, str] = {
     "msg.delete_failed_hint": "Only .zip files inside this installer's backup folder can be deleted",
     "msg.engine_installed": "Engine installed",
     "msg.engine_install_hint": (
-        "{pkg} installed; head to Schemes to install an input scheme"
+        "{pkg} installed. Head to Schemes for an input scheme, then open "
+        "Environment Check to add \"Chinese (Rime)\" to your input sources "
+        "— without it, Rime cannot be selected."
+    ),
+    "msg.goto_doctor": "Open Environment Check",
+    "msg.engine_install_failed": "Engine installation failed",
+    "msg.engine_install_failed_hint": (
+        "apt could not install the engine. The usual cause is a dead third-party "
+        "repository in your sources (404 or missing key), followed by the "
+        "universe component being disabled or no network. The update failure "
+        "itself is now ignored instead of blocking the install; see the Logs "
+        "page for details, then retry once your sources are fixed."
     ),
     "msg.op_done": "Done",
     "msg.restart_framework": "Restart framework",

@@ -6,16 +6,19 @@ Deepin 官方源本身位于国内，无需切换，UI 层会给出说明。
 v1.0.5：写源与 update 合并进同一次 pkexec（单次密码框，真机反馈
 「好几次输入密码」）；apt 经 engine_service.apt_command 降优先级
 （nice + ionice -c3，缓解安装/更新期间系统卡顿）。
+v1.0.31：``sources_codenames()`` 解析源中的发行代号，供 doctor
+「apt 源代号一致性」体检比对（系统升级后旧代号残留的探测）。
 """
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
 import config
-from core.engine_service import apt_command, apt_program
+from core.engine_service import UPDATE_FAILED_NOTE, apt_command, apt_program
 from core.runner import Step
 
 # Ubuntu deb822 源文件位置（24.04+ 默认；旧版回退 sources.list）
@@ -53,6 +56,81 @@ def is_ubuntu() -> bool:
     except OSError:
         return False
     return 'NAME="Ubuntu"' in text or "NAME=Ubuntu" in text
+
+
+#: 口袋后缀：noble-updates / noble-backports 的「基座」仍是 noble
+SUITE_SUFFIXES = ("-updates", "-backports", "-security", "-proposed")
+#: 固定词 suite：不含发行版信息，与 os-release 代号比对时必须剔除
+#: （Debian 系 stable/testing、Deepin 官方源的 deepin…）
+SUITE_STOPWORDS = frozenset(
+    {
+        "stable",
+        "oldstable",
+        "testing",
+        "unstable",
+        "experimental",
+        "sid",
+        "deepin",
+    }
+)
+
+
+def _codenames_from_text(text: str) -> list[str]:
+    """从源文件文本中提取**发行代号**型 suite（去后缀、剔固定词，保序去重）。
+
+    同时覆盖两种格式：
+    - deb822：``Suites: noble noble-updates noble-backports``
+    - 传统一行式：``deb [opts] URI suite [components…]``
+
+    deb822 续行（缩进的裸 suite 行）不展开——Ubuntu 默认源与本工具写入的
+    源均为单行 Suites，真实场景够用；漏展开只会少算一个代号（偏保守）。
+    """
+    codenames: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("Suites:"):
+            suites = line.split(":", 1)[1].split()
+        elif line.startswith("deb ") or line.startswith("deb-src "):
+            parts = [p for p in line.split() if not p.startswith("[")]
+            suites = parts[2:3]  # deb [opts] URI suite …
+        else:
+            continue
+        for suite in suites:
+            base = suite
+            for suffix in SUITE_SUFFIXES:
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            if (
+                base
+                and base not in SUITE_STOPWORDS
+                and base not in codenames
+                and re.fullmatch(r"[a-z][a-z0-9]*", base)
+            ):
+                codenames.append(base)
+    return codenames
+
+
+def sources_codenames() -> list[tuple[str, str]]:
+    """解析 apt 源中的**发行代号**，返回 ``[(代号, 源文件), ...]``。
+
+    供 doctor 的「apt 源代号一致性」体检比对：系统升级（do-release-upgrade /
+    mintupgrade）后旧代号残留时，源里会出现与 os-release 不一致的代号。
+    读不到源文件 / 源中没有代号型 suite 时返回空列表（调用方按无法判断处理）。
+    """
+    found: list[tuple[str, str]] = []
+    for path in (UBUNTU_SOURCES, LEGACY_SOURCES):
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for codename in _codenames_from_text(text):
+            found.append((codename, str(path)))
+    return found
 
 
 def mirrors() -> list[Mirror]:
@@ -103,6 +181,13 @@ def build_switch_steps(mirror: Mirror) -> list[Step]:
 
     此前写源与 update 各包一次 pkexec = 两次密码框；合并后一次提权完成，
     失败时按 set -e 在日志中可直接定位是写文件还是 update 阶段。
+
+    v1.0.30：末尾 apt update 改为**尽力而为**（与引擎安装同款容错）。
+    旧实现整段 `set -e`，update 只要遇到任一失效第三方源（404 / 缺公钥）
+    就以 100 退出 → 整步判失败，用户看到「切换失败」——但新源此刻其实
+    已经写盘成功，local 索引也能正常用。现在 `{ update || echo 警告; }`
+    吞掉非零退出码：写源与 update 任一真实失败（如磁盘只读）仍会因 set -e
+    在写文件阶段暴露，不会把「第三方源报废」误报成「切换失败」。
     """
     codename = system_codename()
     if not codename:
@@ -117,7 +202,8 @@ def build_switch_steps(mirror: Mirror) -> list[Step]:
         f"cat > \"$TARGET\" <<'RIME_EOF'\n{content}RIME_EOF\n"
         'echo "已写入 $TARGET（原文件已备份为 .rime-backup）"\n'
         "echo '===== 已写入新源，更新软件源索引 ====='\n"
-        f"env DEBIAN_FRONTEND=noninteractive {apt_command(apt, 'update')}"
+        "{ " + f"env DEBIAN_FRONTEND=noninteractive {apt_command(apt, 'update')}"
+        + f" || echo '===== {UPDATE_FAILED_NOTE} ====='; }}"
     )
     return _with_pkexec(
         [Step(f"切换 apt 源（{mirror.name}）并更新索引", ["bash", "-c", script], weight=3)]

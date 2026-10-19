@@ -117,8 +117,19 @@ class StateMachine:
             return ActionRule(action, True)
 
         if action == "switch_mirror":
-            if "ubuntu" not in (self.report.os_name or "").lower():
-                return ActionRule(action, False, "apt 镜像切换仅支持 Ubuntu（Deepin 官方源在国内，无需切换）")
+            name = (self.report.os_name or "").lower()
+            if "ubuntu" not in name:
+                # v1.0.29：Linux Mint 的源由 mint 自带工具维护
+                # （official-package-repositories.list 同时含 ubuntu 镜像与
+                # linuxmint-packages），改写 sources.list 会打乱 mint 的仓库组合，
+                # 因此仍然只对 Ubuntu 开放，但把原因说清楚。
+                reason = (
+                    "apt 镜像切换仅支持 Ubuntu（Linux Mint 的源由 mint 自带工具管理，"
+                    "改写会打乱它的仓库组合；可在「软件源」里换 ubuntu 镜像地址）"
+                    if "mint" in name
+                    else "apt 镜像切换仅支持 Ubuntu（Deepin 官方源在国内，无需切换）"
+                )
+                return ActionRule(action, False, reason)
             return ActionRule(action, True)
 
         if action == "appearance_theme":

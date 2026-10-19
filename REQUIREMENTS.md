@@ -5,7 +5,7 @@
 
 ## 1. 项目概述
 
-一款 PyQt6 图形界面的「中州韵（RIME）输入法安装器」，帮助用户在 **Ubuntu 26.04+ / Deepin 25.2+** 上完成 RIME 引擎与输入法方案的安装、配置、卸载全生命周期管理。支持 **X11 与 Wayland** 两种显示协议。界面要求漂亮、大方、友好。
+一款 PyQt6 图形界面的「中州韵（RIME）输入法安装器」，帮助用户在 **Ubuntu 24.04+ / Linux Mint 22.x / Deepin 25.2+** 上完成 RIME 引擎与输入法方案的安装、配置、卸载全生命周期管理。支持 **X11 与 Wayland** 两种显示协议。界面要求漂亮、大方、友好。
 
 ## 2. 技术栈与形态
 
@@ -622,3 +622,225 @@ v1.0.11 同批硬化（Deepin 部署专项核查发现，均非阻断项）：
 - 离屏渲染真实 `SettingsPage`（非 mock）五组：`1180×770` 中文浅色 / 中文深色 / 英文浅色、`940×640` 中文（图标降 72、出纵向滚动条）、`1600×900`（内容限宽 1200 居中）。断言：`pixmap=176×176 @dpr2`（=88 逻辑）、`72 档 → 144×144`、源图 `rime-installer-512.png`、横向滚动条 `maximum=0`。
 - 冒烟 `check_resources` / `check_icon_set` / `check_i18n` / `check_theme` / `check_skin` / `check_window` 全通过；`check_window` 新增 Hero 断言（源图档位、pixmap 非空、88/72 两档物理分辨率、三卡高度 > 0、无横向滚动条），`theme_row` 断言改为 `theme_combo.currentText()`（旧行已不存在）。
 - `check_deb_depends` 之外新增打包断言：`build-deb.sh` 不得出现 `--exclude='./packaging'`。
+
+
+## v1.0.29 — Ubuntu 24.04 / Linux Mint 22.x 支持（修「apt update 短路整条安装链」）
+
+**用户诉求**：该项目能否支持 Ubuntu 24.04 与 Linux Mint 22.3？随后在 Mint 22.3 真机实测，附引擎安装日志：
+
+```
+$ pkexec ... bash -c '... apt-get update && echo ... && apt-get install -y fcitx-rime'
+E: 无法下载 https://ci.deepin.com/repo/obs/linglong:/CI:/release/xUbuntu_24.04/./Packages 404 Not Found
+W: 部分索引文件下载失败。如果忽略它们，那将转而使用旧的索引文件。
+!! 步骤失败：更新软件源索引并安装引擎 fcitx-rime（apt update + install）（退出码 100）
+```
+
+**结论与根因**：
+
+- 界面在 Mint 22.3 上**已正常运行**（日志里有完整的 OS/会话/桌面/前端检测结果，识别为 `Linux Mint / X-Cinnamon / fcitx4` 并据此选中 `fcitx-rime`）。担心的 Qt 版本落差**不成立**：noble 与 resolute 的 `python3-pyqt6` 都是 Qt 6.x 同代（noble 6.6.1 / Qt 6.4.2），qfluentwidgets 未使用 6.5+ 才有的 API。
+- 真正阻断的是 `core/engine_service.build_install_steps` 的**写死串行链**：`apt-get update && echo ... && apt-get install`。apt update 只要遇到任一失效第三方源就以 **100** 退出，`&&` 把 install 一起短路——引擎一步都没跑。这是**所有挂着失效源的机器**的共性缺陷，不是 Mint 特有（真机那两个源：`ci.deepin.com/.../linglong` 404、`repo.steampowered.com` 缺公钥）。
+
+**落地（四处，一次做完）**：
+
+1. `core/engine_service.py`
+   - apt update 改为**尽力而为**：`{ update || echo 警告; } && echo ... && install`。update 失败只留一行警告日志，install 继续走本地已有索引；install 失败仍按 100 传播 → runner 判失败。
+   - 引擎安装后追加 `apt-get install -y librime-bin`（best-effort，`{ ... || echo 提示; }`）：noble/numbat 的 `ibus-rime` / `fcitx5-rime` **都不依赖**它，缺 `rime_deployer` 时「重新部署」只能退回重启框架 + 轮询（v1.0.26 已定过这个坑）。装不上（源里没有该包）只警告，不判任务失败。
+   - `_single_step` 增加 `hint_key` 透传；引擎安装步带 `hint_key="msg.engine_install_failed"`。
+2. `core/i18n.py` / `core/translations/en.py`：新增 `msg.engine_install_failed` 与 `_hint`（软件源失效 / 未启用 universe / 网络不通三条主线 + 「索引更新失败已被忽略」），失败时由 `_on_task_finished` 的既有 `hint_key` 通道弹定向 InfoBar。
+3. `core/detector.py`：`_recommend_frontend` 增加两处
+   - **已装引擎优先**：无运行中框架时，若恰好只有一个引擎包已安装就推荐它。旧实现一律按桌面推 `ibus-rime`，「装了 fcitx5-rime 但框架还没起来」会推荐一个没装的引擎，后续部署/输入源检查全对着错误前端跑。
+   - 显式识别 `X-Cinnamon` / `MINT`（Linux Mint 的 `XDG_CURRENT_DESKTOP` 实测为 `X-Cinnamon`）→ `ibus-rime`。
+4. `core/doctor.py`：输入源检查从「只认 GNOME」扩到 **GNOME + Cinnamon**
+   - `INPUT_SOURCE_SCHEMAS`（关键字 → schema → 展示名）与 `input_source_schema()` / `_read_input_sources()`；Cinnamon 用 `org.cinnamon.desktop.input-sources`（条目格式同样是 `('ibus','rime')`）。
+   - 新增第三态：桌面认对了但 `gsettings`/schema 读不到 → INFO「无法判断 + 引导手动添加」，既不报 BAD 也不谎称「跳过」（旧实现把这种情况也归到「非 GNOME 桌面」）。
+   - `_build_input_source_fix_script(frontend, schema)` 按桌面写不同 schema；标题随桌面变化（`将 中文(Rime) 加入 Cinnamon 输入源并重启 ibus`）。
+   - 体检文案 `ibus_ok/ibus_missing/ibus_no_engine` 改为带 `{desktop}` 占位符，同一套键服务两种桌面。
+5. `core/state_machine.py`：Mint 上 `switch_mirror` 仍禁用，但原因改为讲清楚（Mint 的源由 `mint` 自带工具管理，改写会打乱其仓库组合）；`settings.mirror_hint` / `settings.mirror_note` 同步补充 Mint 说明。
+6. 支持声明：`config.SUPPORTED_SYSTEMS` → `Ubuntu 24.04+ / Linux Mint 22.x / Deepin 25.2+`；README 徽章、环境要求表、已知限制、deb `Description` 同步；`VERSION` 1.0.28 → 1.0.29。
+
+**验证**：
+- 脚本语义单独实证（`bash` 真跑三组）：update 100 / install 0 / deployer 100 → 最终 0 且 install 执行；update 0 / install 100 → 最终 100（失败仍能上报）。
+- 冒烟新增断言：内层脚本 `bash -n` 语法检查（避免花括号容错组写坏整条命令）、`||` 必须落在 update 段、`librime-bin` 出现在安装链、`hint_key` 正确、跳过 update 时不含 update 但仍装部署工具；`_recommend_frontend` 的 Cinnamon 与「已装引擎优先」两组；Cinnamon 输入源三态（bad+可修复 / ok / info）与修复脚本写入 cinnamon schema；Mint 上 `switch_mirror` 禁用且原因含 `Mint`。
+
+## v1.0.30 — 版本通配判定 + 镜像切换容错（系统升级后零改动可用）
+
+**用户诉求**：①「不要在意 Ubuntu 系统版本」——用通配符获取系统版本号，以后用户系统升级也能用；②遇到失效的第三方源（或无法访问的源）就跳过，让用户顺利完成安装。
+
+**结论与设计**：
+
+- **运行时检测本就是通配的**：`detector._detect_os()` 读 os-release `VERSION_ID`、`apt_mirror.system_codename()` 读 `VERSION_CODENAME`，镜像 suites / 测速 URL 全部按 codename 运行时拼接——全仓没有任何按版本号的运行时门禁，v1.0.29 的 Mint 22.3 真机日志即为证据。
+- 真正硬编码的只剩**展示层**（`SUPPORTED_SYSTEMS` 字符串）与一处**容错缺口**（镜像切换的 `apt update` 仍是 `set -e` 严格链）。因此本版不做「按版本放行/拒绝」的逻辑——那种逻辑本身就是反通配的。
+
+**落地（四处）**：
+
+1. `core/compat.py`（新增）：版本通配判定。`parse_version()` 逐段解析（`24.04→(24,4)`、`24.04.1→(24,4,1)`、`rolling/空/非数字→None`）；`FAMILY_MIN` 只写**家族匹配串（NAME 小写子串）+ 实测最低版本**（ubuntu (24,4) / linux mint (22,0) / deepin (25,2) / uos (25,2)），**只写下限不写上限**——任何更高版本（含未来 28.04、Mint 23）经元组比较自动落入 `OK`，不为每个新版本加分支。`support_verdict()` 输出三态：`OK`（已识别且不低于基线）/ `BELOW`（低于基线，不阻断、如实告知）/ `UNKNOWN`（NAME 不含已知家族或版本不可解析，按通用 Linux 处理）。子串匹配而非相等：Ubuntu Kylin 等官方衍生同样命中。模块纯函数、不读文件、不抛异常；**源码中禁止出现任何发行版代号（noble/zena…）**——认代号即把通配退化成认版本。
+2. `config.py`：`VERSION` 1.0.29 → 1.0.30；`SUPPORTED_SYSTEMS` 改区间式 `Ubuntu 24.04 及以上 / Linux Mint 22 及以上 / Deepin 25.2 及以上（X11 / Wayland）`（下限定死、上沿不封顶）。
+3. `core/apt_mirror.py`：`build_switch_steps` 末尾 `apt update` 改 `{ update || echo 警告; }` 尽力而为（与引擎安装同款）。旧实现整段 `set -e`，失效第三方源（404 / 缺公钥）让 update 返回 100 → 整步判「切换失败」，而新源此刻已写盘成功、本地索引也能用。真实失败（磁盘只读等）仍在写文件阶段由 `set -e` 暴露。`UPDATE_FAILED_NOTE` 由 `engine_service` 导出、两处共用。
+4. `ui/pages/settings_page.py`：Hero meta 区新增「当前系统」列（`_ElidedLabel`，stretch 3；「适用系统」由 5 调 3），显示 `运行时 os_name + os_version + compat 判定结果`（`settings.support_ok/below/unknown` 三条 i18n 文案带 `{minimum}` 占位符）。与写死的「适用系统」互补：系统升级后这里自动显示实际版本与判定，无需为新版本改代码。
+5. `_IconBadge` 新增 `last_pixmap` 属性（`_render` 交给 `setPixmap` 的原始位图），冒烟的 Hero 图标物理分辨率断言改断它。**Qt 6.11 起 `QLabel.pixmap()` getter 会按控件自身 DPR 归一化后返回**（2.0 的 176px 位图经 setPixmap()/pixmap() 往返后变 1.0、宽高减半），继续断 label 位图会误报「分辨率不足」。渲染路径本身未变（`QIcon.pixmap(size, 2.0)` 实测仍出 176 物理像素）。附带修：源图缺失两处早退分支同步清 `_rendered`。
+
+**验证**：
+
+- 冒烟新增 `check_compat`：`parse_version` 六组正常 + 五组异常；`support_verdict` 十四组（含 **Ubuntu 28.04 / Mint 23 两组「未来版本」回归**——必须落入 `OK`）；unknown 不带家族信息；`minimum_text` 随家族变化；结构性断言 `compat.py` 源码不含 noble/jammy/zena/resolute/plucky/lunar 六个代号、`FAMILY_MIN` 恰四个家族；`verdict_line` 三态不抛异常。
+- `check_apt_mirror` 新增：切换脚本必须含 `||` 与 echo 留痕、容错分支包住 update（`||` 落在 update 之后）、内层脚本 `bash -n` 语法检查。
+- `check_i18n`：四个新 `settings.*` 键纳入「主干键必须有英文翻译」清单（中英双补，防拼写漂移）。
+- 版本断言同步 `1.0.30`；README 徽章 / 环境要求 / 已知限制 / deb `Description` 同步区间式表述。
+- 环境注记（非产品缺陷）：① 整轮冒烟在 skin 清理阶段被沙箱 safe-delete 钩子拦截（已知行为，逐项 flush 后以 `tools/rerun_flow_checks.py` + 独立进程补跑）；② `appearance_flow` 在**同进程长串**里 ibus CLI 子进程静默退出 1——日志末行是钩子拦截 `resources/plum/.rw-probe`（`import config` 的可写探针 unlink），配额按 Bash 调用重置，独立进程复跑即过；③ window 的 Hero 图标断言在 Qt 6.11（开发 venv）下因 getter 归一化误报，已按上述第 5 条改断 `last_pixmap`，复跑通过。
+
+## v1.0.31 — apt 源代号一致性体检（「获取升级信息」的落地）
+
+**用户诉求**（P2 阶段）：「用通配符获取系统版本号，以后用户系统升级也能用……获取升级信息」。v1.0.30 已把版本判定通配化（`core/compat.py`），本版补上升级链路的最后一环：**系统升级后，安装器如何知道「源还指向旧版本」**。
+
+**结论与设计**：
+
+- Ubuntu / Linux Mint 的 apt 源按**发行代号**（noble / zena）寻址。`do-release-upgrade` / `mintupgrade` 正常会改写源，但三种情况会残留旧代号：①曾用本程序「apt 镜像」改写过的 `ubuntu.sources`（升级工具不重写它的 Suites 组合）；②手工添加的第三方源；③升级中断。表现为**「升级后 apt 还能 update，但装到的全是旧版包」**——引擎安装看起来成功，版本却不对。这正是「升级信息」最该被捕获的状态。
+- 探测全部走运行时读取（os-release `VERSION_CODENAME` + 源文件解析），与 v1.0.30 通配思路一脉相承：**不为任何具体版本写死分支**，Ubuntu 28.04 / Mint 23 发布当天即可正确比对。
+
+**落地（两处）**：
+
+1. `core/apt_mirror.py`
+   - `_codenames_from_text(text)`：从源文本提取**代号型** suite——同时覆盖 deb822（`Suites: noble noble-updates`）与传统一行式（`deb [opts] URI suite …`，方括号选项先剔除再取第 3 段）；剥口袋后缀（`-updates/-backports/-security/-proposed`）后取基座；剔除固定词 suite（Debian `stable/testing`、Deepin 官方源的 `deepin` 等 `SUITE_STOPWORDS`）；只收 `[a-z][a-z0-9]*` 形状，保序去重。deb822 续行不展开（默认源与本工具写入的源均为单行 Suites，漏展开只会少算一个代号，偏保守）。
+   - `sources_codenames()`：读 `ubuntu.sources` 与 `sources.list`，返回 `[(代号, 源文件), …]`；读不到返回空列表（调用方按无法判断处理）。
+2. `core/doctor.py`
+   - 新增体检项 `apt_codename`（第 8 项，置于 rime_dir 之后——与 rime 无关，属「升级后还能不能装」的基础设施检查），**不可自动修复**（改哪个源由用户决定），四态：
+     - `OK`：源中代号 ⊆ 运行时代号集合；
+     - `WARN`：存在不一致代号，详情点名**残留代号 + 所在文件名**，建议到「软件和更新 / 软件源」更新或禁用、曾切换过镜像可重跑一次；
+     - `INFO`：非 Ubuntu 系（Deepin 的 suite 是固定词）/ 系统无 `VERSION_CODENAME` / 源中无代号型 suite——无法判断就明说，不谎称「跳过」也不误报。
+   - 家族口径：Ubuntu 只认 `VERSION_CODENAME`；**Mint 额外放行 `UBUNTU_CODENAME`**（Mint 源同时引用自身代号与 Ubuntu 基座代号，实测 zena + noble 并存，只认一个必然误报）。
+   - 新增 `_read_os_release()` 解析 `/etc/os-release`。
+3. `core/translations/en.py`：`doctor.check.apt_codename.*` 七组英文键（title + 六个分支的 detail/advice），中文由 doctor 字面量提供（沿用既有回退机制）。
+4. `config.py`：`VERSION` 1.0.30 → 1.0.31（`SUPPORTED_SYSTEMS` 已是区间式，不动）。
+
+**验证**：
+
+- `check_doctor` 新增断言：期望键列表加 `apt_codename`；解析器直测（deb822 + 传统行 + `[arch=]` 选项 + `noble-security` 后缀剥离 + `stable`/`deepin` 固定词剔除 → 恰 `["noble", "jammy"]`）；真机 `sources_codenames()` 调用不抛异常且返回条目形状合法；打桩三态（Mint zena+noble → OK；升级残留 → WARN 且详情含代号与文件名；Ubuntu 一致 → OK、旧代号 → WARN；无代号源/Deepin/无系统代号 → INFO）；`fixable` 恒 False 且 `build_fix_steps("apt_codename")` 返回空。
+- 既有断言兼容：体检页英文标题覆盖（`doctor.check.apt_codename.title` 已在 EN_TEXT）、体检项 title 不被英文裁切（"apt source codename" 短于现有最长标题）。
+- 版本断言同步 `1.0.31`；README 徽章、环境修复章节补充「apt 源代号」说明；SMOKE OK 串加「apt源代号」。
+
+## v1.0.32 — apt 源可用性体检（失效第三方源点名，官方源永不建议禁用）
+
+**用户诉求**（P3 阶段）：「遇到失效的源或者无法访问的第三方源就跳过……这样就能让用户顺利的安装」，并明确安全边界：**禁用的是第三方软件的源，系统的官方源不要禁用，很危险**。
+
+**结论与设计**：
+
+- v1.0.29 的 update 容错已保证「坏源不阻断安装」；P3 补上**可见性**——把失效源逐个点名，让用户能事后清理。定位后**只引导手动禁用**，程序自身不改任何源文件（用户决定论）。
+- 安全边界落到分类策略上：**宁可漏报，不可错报**。误把官方源判成第三方，用户照着指引去禁用，是比漏报严重得多的失败模式：
+  - 官方：Ubuntu 官方主机（archive/security/ports…）、知名国内镜像主机**且路径落在 `/ubuntu` 或 `/linuxmint*`**（同主机上的 kubernetes、docker-ce 目录是第三方，不能算）、Mint 与 Deepin 官方源主机；
+  - 第三方：PPA、Steam、Microsoft、Google、Docker、`ci.deepin.com`（OBS/CI 仓库，非系统底座源）等已知第三方主机，或 `ppa.*` 主机；
+  - **未识别：一律保守按官方处理**——不可达时只说「请自行确认」，不给任何禁用指引。
+
+**落地（三处）**：
+
+1. `core/apt_health.py`（新增）
+   - 解析：`parse_source_entries` 同时覆盖 deb822（`Types/URIs/Suites`，多 URI × 多 suite 展开、续行并入）与一行式（`deb [opts] URI suite comps…`，方括号选项先剔除取第 3 段；注释与 `file:`/`cdrom:` 本地源跳过）；`read_source_entries` 读两个源文件、按 `(uri, suite)` 去重。
+   - 分类：`classify()` 上表三档；`SourceEntry.kind/label`（label = 域名+路径，用于行内点名）。
+   - 探测：`probe_url` 对 `{uri}/dists/{suite}/InRelease` 发 GET，404 退一步试 `Release`；返回 `(ok, reason)`（HTTP 码 / 超时 / 连接失败原因）。`check_health` 用 ThreadPool 并行（同镜像测速模型），`prober` 可注入（冒烟不打网络）。
+   - 缓存：模块级 `HealthReport` + `mark_probing/store_report/abort_probing/last_report/is_probing/is_stale`（TTL 600s）；`probing_enabled()` 总开关，`RIME_INSTALLER_NO_SOURCE_PROBE=1` 关闭自动探测（冒烟用）。
+   - GPG 缺钥（NO_PUBKEY）无法用 HTTP 状态识别——留给后续可选的提权深度检测，本版不涉。
+2. `core/doctor.py`：新增体检项 `apt_sources`（第 9 项，只读缓存、本函数无网络 IO）。五态：`probing`/`not_tested`（INFO）/ `ok` / `third_failed`（WARN，点名 + 「只禁第三方源，切勿禁用系统官方源」指引）/ `official_failed`（WARN，「不要禁用」）。**不可自动修复**——`build_fix_steps("apt_sources")` 恒空。
+3. `ui/pages/doctor_page.py`：`bind` 时按 TTL 起 `AptHealthWorker(QThread)` 后台探测（run_checks 保持纯计算的铁律不动），完成后重算体检行。**不加工具栏按钮**——v1.0.27 已实证工具栏是页面最小宽度的主导项（第 6 个按钮就把英文最小宽度顶过窗口），第 7 个必爆；自动探测也免去了用户找入口。探测异常只落「尚未检测」，不冒泡到事件循环。
+
+**验证**：
+
+- `check_doctor` 新增断言：deb822/传统行解析（含 `[arch=]`、注释、`file:` 跳过）；分类十组（含「国内镜像主机上的 kubernetes 目录必须算未识别」「ci.deepin.com 必须算第三方」）；真机 `read_source_entries()` 不抛异常；注入假 prober 组装报告驱动体检行五态（第三方失效 → WARN + 点名 + 「只禁第三方源」；官方失效 → WARN + 「不要禁用」且详情不出现第三方源；全可达 → OK；无缓存 → 「尚未检测」；探测中 → 「检测中」）；`fixable` 恒 False、`build_fix_steps` 恒空；`RIME_INSTALLER_NO_SOURCE_PROBE=1` 时探测开关关闭。
+- `check_window`：窗口构建期设置 `RIME_INSTALLER_NO_SOURCE_PROBE=1`，避免离屏冒烟触发真实网络探测；探测逻辑由注入 prober 全覆盖。
+- 版本断言同步 `1.0.32`；README 徽章、环境修复章节补充「apt 源可用性」说明（含官方源安全边界）；SMOKE OK 串加「apt源可用性」。
+
+## v1.0.32 发布包（build/rime-installer_1.0.32_amd64.deb）
+
+`bash packaging/build-deb.sh` 构建，产物 `build/rime-installer_1.0.32_amd64.deb`（22 MB，amd64，360 条目）。
+
+**入包校验（逐项实测）**：
+
+| 校验项 | 结果 |
+| --- | --- |
+| control 版本 / 架构 / Depends | `1.0.32` / `amd64` / 含 `python3-pyqt6.qtsvg`、`qt6-qpa-plugins` 等急切导入链 |
+| v1.0.30~32 新增模块 | `core/compat.py`、`core/apt_health.py`、`core/apt_mirror.py` 均在包内 |
+| 运行时图标 | `packaging/icons/rime-installer-512.png`（设置页 Hero）随应用树发布；hicolor 八档 16/24/32/48/64/128/256/512 全在 |
+| 子模块完整性 | `core/`（25）、`ui/`（5）、`ui/pages/`（10）与源树逐名一致，差异仅 `__pycache__`；`resources/bundled_themes` 11 个内置主题齐全 |
+| 排除项 | `.venv`、`smoke_test.py`、`design/`、`REQUIREMENTS.md`、`rayburst-main`、`New-Logo.png`、`preview-*.png`、`tools/{diag_layout,rerun_flow_checks,preview_settings_mockup,render_doctor_page}.py`、`packaging/build-deb.sh`、`__pycache__`/`*.pyc` 计数均为 0 |
+| 冒烟残留 | `.smoke-tmp`、`.smoke-out.log` 已排除（源树当时确有残留） |
+
+**装机后自足性**（`dpkg-deb -x` 解包目录当 PROJECT_ROOT 实跑，解包 287 个文件）：`import config` 通过，`VERSION=1.0.32`，`APP_ICON`/`APP_LOGO`/`PLUM_RIME_INSTALL`/aria2 二进制**路径全部存在**——即 v1.0.27 那类「静态资源被整目录排除 → 界面少一块且无报错」的故障未复现。（解包目录内 `core` 的全量导入需 PyQt6，本机系统 python 未装，属环境限制，非包缺陷。）
+
+## v1.0.33 — 修复 Ubuntu 24.04 / Mint 22.3 上「点很多功能就闪退」（QThread 退出竞态）
+
+**用户诉求**：v1.0.32 装机后在 Ubuntu 24.04 与 Linux Mint 22.3 上**频繁闪退**——「点很多功能的时候软件都会经常闪退，没办法正常的运行」。用户提供了两套真机日志（`故障日志/`）：任务日志全部正常完成（引擎安装 / 方案安装 / 检查更新 / 写登录配置 / 重启框架 / 配置工具），崩溃只发生在窗口侧。
+
+**根因（实证闭环）**：
+
+launcher.log 里每次崩溃都是 `退出码=134`（SIGABRT）+ 同一行 stderr：`QThread: Destroyed while thread is still running`——即 **QThread 对象在 `isRunning()` 仍为真时被析构**，Qt 据此 qFatal。对照代码，三个后台 worker 的完成信号都发在 `run()` **内部**（`self.done.emit(...)` 位于 run() 末尾），而主线程槽函数收到信号的**第一件事就是清引用**：
+
+| 位置 | 旧行为 | 触发时机（对应用户「点很多功能」） |
+| --- | --- | --- |
+| `ui/main_window.py::_on_detect_done` | `self._detect_worker = None` | **每个任务结束**（`_on_task_finished` → `redetect_async`）、欢迎页/体检页「重新检测」 |
+| `ui/pages/doctor_page.py::_on_health_probed` | `self._health_worker = None` | **窗口构建后约数秒**（bind → `AptHealthWorker` 网络探测完成）、每次 redetect 分发 |
+| `ui/pages/settings_page.py::_on_speedtest_done` | 不清引用（潜在） | 镜像测速完成 |
+
+信号发出时线程还在退出序列里（`isRunning()` 仍真），队列槽一旦先于线程退出执行，清引用就等于把最后一个 Python 包装对象交给 GC → `~QThread()` 撞 `isRunning()` → SIGABRT。与真机日志逐条吻合：Ubuntu 崩溃在引擎安装任务结束 12s 后（detect 探活耗时量级）；Mint 三次崩溃有两次在窗口显示后 3~4s（恰为源探测完成时刻），且 `runtime-trace.log` 无「事件循环退出」痕迹（猝死非正常退出）。
+
+离线实证（`.venv` PyQt6 6.11，与生产同构的最小复现）：300 轮内必现 `退出码 134` + 同款 stderr；插桩直接拍到 `__del__` 时 `isRunning=True`。竞态在开发机（沙箱）胜率极低（槽入口 0/100 撞上运行中线程），故离屏冒烟长期全绿、真机却反复崩——**机器负载 / 核数 / PyQt6 版本（装机用系统 6.4~6.6）差异即胜率差异**，这也解释了「开发机复现不了」。
+
+**修复（三处 + 一个公共助手，全部「先等线程退出再丢引用」）**：
+
+1. `ui/pages/base.py`：新增 `reap_worker(worker, timeout_ms=5000) -> bool`——线程在跑就 `wait()`（sip 在等待期释放 GIL，不与工作线程抢解释器锁；完成信号本就在 run() 末尾，正常路径毫秒级），返回「引用已可安全丢弃」。
+2. `ui/main_window.py`：`_on_detect_done` 改为 `reap_worker` 通过后才清 `_detect_worker`；新增 `closeEvent`——关窗前回收 `_detect_worker` 与两个页面的 worker（有界等待 10s，detect 实测约 2.5s），杜绝「关窗即窗口销毁 → 最后一个引用落地 → 线程还在跑」的同款崩溃。
+3. `ui/pages/doctor_page.py` / `ui/pages/settings_page.py`：`_on_health_probed` / `_on_speedtest_done` 同样先 reap 再清引用；两页新增 `shutdown_workers()` 供主窗口 `closeEvent` 调用。
+
+**验证**：
+
+- 最小复现（未修）：134 + 同款 stderr，`__del__` 撞 `isRunning=True`；（已修）同画像 200 轮 + 真实窗口 CPU 密集型桩 100 轮全部存活，`__del__` 100% 晚于线程退出。
+- `smoke_test.py` 新增 `_check_worker_reap` 回归（check_window 尾部执行）：① 真实 `_DetectWorker` 经 `redetect_async` 跑完后引用被回收且进程不猝死（修复缺失时该用例会直接 134 杀全轮冒烟）；② 慢速桩 worker 在跑时关窗，`closeEvent` 回收后不再运行、引用最终清掉。
+- 版本断言同步 `1.0.33`；README 徽章同步。
+
+## v1.0.34 — 修复 Mint 22.3「装完找不到中州韵输入法选项」（前端漂移）
+
+**用户诉求**：v1.0.33 修掉闪退后，用户在 Linux Mint 22.3 上装完软件**找不到对应的中州韵输入法选项**。
+
+**根因（真机日志实证）**：同一个会话里**前后用了两个不同的前端**——`frontend` 的取值口径不一致：
+
+| 阶段 | 依据的字段 | 取值 | 后果 |
+| --- | --- | --- | --- |
+| 15:19 首次启动（环境干净） | `recommended_frontend`（Cinnamon 默认） | ibus-rime | 装 ibus-rime ✓、方案落 `~/.config/ibus/rime` ✓ |
+| 15:26 重开应用（启动环境带 `GTK_IM_MODULE=fcitx`） | `active_frontend`（启动环境快照） | **fcitx-rime** | 此后一切操作全部对着 fcitx 跑 |
+
+`active_frontend` 只是**某一次启动环境**的快照：`GTK_IM_MODULE` 用户终端里 export 过就跟着变；框架进程起没起是时序。重开后它翻成 fcitx-rime，于是：
+
+- 「写入登录环境变量」写的是 `GTK_IM_MODULE=fcitx` 等（GTK 应用转而加载**并不存在**的 fcitx IM 模块）；
+- 「重启输入法框架」执行 `pkill -x fcitx; setsid fcitx -d`——fcitx 根本没装，**静默无操作**，ibus-daemon 从未被重启 → ibus 从未加载 rime 组件 → **输入源列表里始终没有「中文(Rime)」**（日志逐条吻合：`setsid fcitx-configtool` 同样不存在）；
+- 体检的「输入源注册」检查因此走 fcitx-rime 分支（只给文字建议），v1.0.29 就给 Cinnamon 加好的 **gsettings 一键修复从未触发**。
+
+即：引擎和方案都装对了，但「让输入法出现在输入源列表里」这最后一步打在了错误的前端上。
+
+**修复（锚定「已装引擎」这一 ground truth）**：
+
+1. `core/detector.py` 新增 `EnvReport.effective_frontend`：**只装了一个引擎包就以它为准**；多个并存时取与运行信号匹配的那个；一个都没装时才采信 `active_frontend`（用户在用的）/ `recommended_frontend`（按桌面猜）。`_recommend_frontend` 同步改为引擎优先（旧实现 active 排最前，漂移后连「再点一次安装引擎」都会装错包）；`_detect_rime_dir` 候选顺序改 effective 打头（防止配置目录指到用户手工试过的 fcitx 目录）；`env_var_mismatches` 的比对基准同步。
+2. `core/doctor.py`：`run_checks` 与 `build_fix_steps` 的 frontend 统一改 `effective_frontend`——Mint 画像下「输入源注册」恢复走 Cinnamon 分支，一键修复把 `('ibus','rime')` 写进 `org.cinnamon.desktop.input-sources` 并重启 ibus-daemon。
+3. `ui/main_window.py`：写登录环境变量、重启框架、重新部署、配置工具、引擎装卸五处口径统一为 `effective_frontend`；引擎安装成功的 InfoBar 增加「去环境体检」跳转按钮，提示文案补上「加入输入源」这一步（中英）。
+4. 版本 1.0.33 → 1.0.34（config / smoke 断言 / README 徽章同步）。
+
+**验证**：
+
+- `smoke_test.py` 新增 `check_frontend_consistency`：完整复刻 Mint 漂移画像（ibus-rime 已装 + `GTK_IM_MODULE=fcitx`），断言 effective/recommended 均为 ibus-rime、环境变量判冲突、体检报「输入源未添加」且一键修复产出 Cinnamon gsettings 步骤与 ibus 环境变量；另覆盖无引擎（GNOME/Cinnamon/KDE 原口径）、双引擎并存、fcitx5 装机画像。
+- **负向对照**：把 `effective_frontend` 退回旧口径（`active or recommended`），该检查复现真机同款故障形态 8 项——输入源检查掉进 fcitx 分支（INFO 不可修）、环境变量修复写 fcitx 值、重启命令打 fcitx——证明测试确实咬住这个 bug。
+- 冒烟：`check_detector` / `check_frontend_consistency` / `check_doctor` 全过；离屏全量冒烟与 deb 构建入包校验见发布记录。
+
+## v1.0.35 — fcitx4 装机链补装 fcitx-config-gtk（修「配置工具」静默失败）
+
+**用户诉求**：确认软件可用于 fcitx4（旧版 fcitx）环境后，要求补上「配置工具」按钮在纯净 fcitx4 机器上打不开的缺口，并确认不影响 fcitx5。
+
+**根因（包依赖已核，packages.ubuntu.com/noble）**：fcitx4 添加/上移输入法全靠图形配置工具 `/usr/bin/fcitx-configtool`，而它所属的 `fcitx-config-gtk` **不在 `fcitx-rime` 的依赖链里**（fcitx-rime 的 Recommends 只有 fcitx 守护进程本身）。引擎安装链只装 `fcitx-rime` + `librime-bin`，于是纯净 fcitx4 机器上 `setsid fcitx-configtool` 静默失败（命令不存在），用户被体检引导去点一个点不动的按钮。fcitx5 无此问题：`fcitx5-configtool` 由 `fcitx5` 包的 Recommends（`fcitx5-config-qt`）默认随装；`ibus-setup` 由 `ibus` 包提供。
+
+**落地**：
+
+1. `config.py`：新增 `FRONTEND_EXTRA_PACKAGES = {"fcitx-rime": ["fcitx-config-gtk"]}`——**按前端门控**，注释写清为何只有 fcitx4 需要（防后人给 fcitx5/ibus 乱加）。
+2. `core/engine_service.py`：`build_install_steps` 在 deployer 段之后按 `FRONTEND_EXTRA_PACKAGES.get(frontend)` 追加 best-effort 安装（`{ install || echo 提示; }`，装不上只警告、不判任务失败）；ibus / fcitx5 的安装链一字不变。`build_uninstall_steps` **不主动 purge 附加包**——用户可能自装、卸载 rime 也不代表不用 fcitx4（其他输入法还在用），孤立包交给 apt autoremove；docstring 注明原因。
+3. `core/doctor.py` + `core/translations/en.py`：fcitx4 分支的体检建议补一句「若配置工具打不开：sudo apt install fcitx-config-gtk」（中英同步）——覆盖 v1.0.35 之前装机、工具仍缺失的存量机器。
+4. 版本 1.0.34 → 1.0.35（config / smoke 断言 / README 徽章同步）。
+
+**验证**：
+
+- `smoke_test.check_engine_service` 新增三组断言：① fcitx4 安装链必须包含 `fcitx-config-gtk` 且为 best-effort（安装位置之后有 `|| echo` 兜底）；② **防串味**——ibus/fcitx5 的安装链（update_first 两种变体）不得出现该包；③ 卸载链不得 purge 附加包。内层脚本 `bash -n` 语法校验既有覆盖自动含新段。
+- 负向对照：把 `FRONTEND_EXTRA_PACKAGES` 置空（=修复前）→ 断言报错；给 ibus 也塞该包（=串味）→ 断言报错。证明测试咬住两个方向。
+- 实跑生成的安装脚本人工核对：`{ update || echo; } && install fcitx-rime && { librime-bin || echo; } && { fcitx-config-gtk || echo; }`，单步单次 pkexec、nice/ionice 降级保持。
+- 对 fcitx5 的影响：无。门控只在 `frontend == "fcitx-rime"` 时追加；fcitx5 路径的引擎安装、重启（`fcitx5 -d`）、配置工具（`fcitx5-configtool`，随 fcitx5 包 Recommends 装上）全部不变，冒烟断言②固化这一点。

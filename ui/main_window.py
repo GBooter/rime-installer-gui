@@ -24,7 +24,7 @@ from qfluentwidgets import (
     PushButton,
 )
 from PyQt6.QtCore import QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QIcon
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QIcon
 from PyQt6.QtWidgets import QDialog
 
 import config
@@ -78,6 +78,7 @@ from core.snapshot_service import (
 from core.state_machine import StateMachine
 from ui.pages.appearance_page import AppearancePage
 from ui.pages.backup_page import BackupPage
+from ui.pages.base import reap_worker
 from ui.pages.doctor_page import DoctorPage
 from ui.pages.engine_page import EnginePage
 from ui.pages.log_page import LogPage
@@ -335,11 +336,13 @@ class MainWindow(MSFluentWindow):
     # ---- 引擎任务 ----
 
     def _on_install_requested(self, update_first: bool) -> None:
-        frontend = self.report.recommended_frontend
+        # v1.0.34：装哪个引擎以「已装引擎」为锚（effective_frontend），
+        # 无引擎时才信运行中的框架/桌面猜测——避免装错包
+        frontend = self.report.effective_frontend
         self._start_task("engine-install", build_install_steps(frontend, update_first=update_first))
 
     def _on_uninstall_requested(self, purge_user_data_flag: bool) -> None:
-        frontend = self.report.recommended_frontend
+        frontend = self.report.effective_frontend
         pkg = engine_package(frontend)
         lines = [f"将执行：apt purge {pkg} 并清理孤立依赖。", f"目标前端：{frontend}"]
         if purge_user_data_flag:
@@ -681,7 +684,9 @@ class MainWindow(MSFluentWindow):
         但它改的是「下次登录才生效」的环境变量，所以照样先弹确认框，把
         写了什么、何时生效、怎么撤销逐条写明，用户点确定才执行。
         """
-        frontend = self.report.active_frontend or self.report.recommended_frontend
+        # v1.0.34：effective_frontend（已装引擎锚定）——瞬时信号会让
+        # 环境变量/重启框架/配置工具打到不存在的框架上（Mint 真机实证）
+        frontend = self.report.effective_frontend
         targets = im_env.login_targets()
         # 把要写的变量逐条摆出来（而不是只说「四个环境变量」）：
         # 这类改的是「下次登录」的全局行为，用户有权在点确定前看到具体值
@@ -714,13 +719,17 @@ class MainWindow(MSFluentWindow):
         self._start_task("doctor-write-login", steps, running_key="login-env")
 
     def _on_frontend_restart(self) -> None:
-        frontend = self.report.active_frontend or self.report.recommended_frontend
+        # v1.0.34：effective_frontend（已装引擎锚定）——瞬时信号会让
+        # 环境变量/重启框架/配置工具打到不存在的框架上（Mint 真机实证）
+        frontend = self.report.effective_frontend
         steps = build_restart_steps(frontend)
         self._start_task("frontend-restart", steps, running_key="restart")
 
     def _on_redeploy(self) -> None:
         rime_dir = self.report.rime_user_dir
-        frontend = self.report.active_frontend or self.report.recommended_frontend
+        # v1.0.34：effective_frontend（已装引擎锚定）——瞬时信号会让
+        # 环境变量/重启框架/配置工具打到不存在的框架上（Mint 真机实证）
+        frontend = self.report.effective_frontend
         if rime_dir is None:
             InfoBar.error(
                 title=i18n.tr("msg.no_rime_dir"),
@@ -734,7 +743,9 @@ class MainWindow(MSFluentWindow):
         self._start_task("frontend-redeploy", steps, running_key="redeploy")
 
     def _on_open_config_tool(self) -> None:
-        frontend = self.report.active_frontend or self.report.recommended_frontend
+        # v1.0.34：effective_frontend（已装引擎锚定）——瞬时信号会让
+        # 环境变量/重启框架/配置工具打到不存在的框架上（Mint 真机实证）
+        frontend = self.report.effective_frontend
         steps = build_open_config_tool_steps(frontend)
         self._start_task("config-tool", steps, running_key="config")
 
@@ -1150,7 +1161,9 @@ class MainWindow(MSFluentWindow):
 
         self.redetect_async()
 
-        frontend = self.report.recommended_frontend
+        # v1.0.34：effective_frontend——成功提示里的包名必须与真正装着的
+        # 引擎一致（Mint 真机：装着 ibus-rime 却提示 fcitx 相关文案）
+        frontend = self.report.effective_frontend
         if ok:
             if kind == "backup-create":
                 infos = self._refresh_backups()
@@ -1186,15 +1199,23 @@ class MainWindow(MSFluentWindow):
                 restart.clicked.connect(self.doctor_page.restart_requested.emit)
                 bar.addWidget(restart)
             elif kind == "engine-install":
-                InfoBar.success(
+                # v1.0.34：装完引擎只是第一步——ibus 系桌面（GNOME/Cinnamon/Mint）
+                # 还必须把「中文(Rime)」加进输入源，否则就是真机反馈的
+                # 「装完找不到中州韵输入法选项」。一键入口在体检页，这里直接
+                # 给跳转按钮，别让用户自己去找。
+                bar = InfoBar.success(
                     title=i18n.tr("msg.engine_installed"),
                     content=i18n.tr(
                         "msg.engine_install_hint", pkg=engine_package(frontend)
                     ),
                     parent=self,
                     position=InfoBarPosition.TOP,
-                    duration=5000,
+                    duration=8000,
                 )
+                goto_doctor = PushButton(i18n.tr("msg.goto_doctor"))
+                goto_doctor.setFixedHeight(26)
+                goto_doctor.clicked.connect(lambda: self.switchTo(self.doctor_page))
+                bar.addWidget(goto_doctor)
             elif kind in ("frontend-restart", "frontend-redeploy", "config-tool"):
                 InfoBar.success(
                     title=i18n.tr("msg.op_done"),
@@ -1395,7 +1416,15 @@ class MainWindow(MSFluentWindow):
         self._detect_worker.start()
 
     def _on_detect_done(self, report) -> None:
-        self._detect_worker = None
+        # v1.0.33：done 信号是在 run() 内部发出的，槽收到时线程可能仍走在
+        # 退出序列里（isRunning() 仍为真）——此刻直接清引用会让最后一个
+        # Python 包装对象立即销毁，~QThread() 撞 isRunning() → qFatal →
+        # SIGABRT(134)。真机 Ubuntu 24.04 / Mint 22.3「点很多功能就闪退」
+        # 的根因（每个任务结束都会触发一次 redetect_async）。先等线程真正
+        # 退出再清引用；正常路径只阻塞毫秒级（详见 base.reap_worker）。
+        worker = self._detect_worker
+        if reap_worker(worker):
+            self._detect_worker = None
         self.report = report
         try:
             self._refresh_installed()
@@ -1407,6 +1436,18 @@ class MainWindow(MSFluentWindow):
             installed_schemes=len(self._installed_keys),
         )
         self._dispatch()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        # v1.0.33：关窗即窗口销毁，会丢掉后台 worker 的最后一个引用——线程
+        # 若还在跑，~QThread 撞 isRunning() → qFatal(SIGABRT 134)。关窗前
+        # 先等各线程退出（有界等待：detect 实测约 2.5s，上限 10s 覆盖其
+        # 最坏子进程超时叠加），再放行关闭。
+        reap_worker(getattr(self, "_detect_worker", None), 10_000)
+        for name in ("doctor_page", "settings_page"):
+            shutdown = getattr(getattr(self, name, None), "shutdown_workers", None)
+            if callable(shutdown):
+                shutdown()
+        super().closeEvent(event)
 
     def _dispatch(self) -> None:
         for name in _INSTALL_PAGES:
