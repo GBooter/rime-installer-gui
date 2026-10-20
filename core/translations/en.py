@@ -255,6 +255,9 @@ EN_TEXT: dict[str, str] = {
     # ---- Theme (v1.0.16: market removed; keep switch + open directory) ----
     "appearance.open_themes_dir": "Open theme directory",
     "appearance.open_themes_dir_tip": "Open the fcitx5 user theme directory in a file manager; drop a custom theme folder in, then come back to switch",
+    "appearance.refresh_themes": "Refresh theme list",
+    "appearance.refresh_themes_tip": "Rescan the theme directory to pick up newly added themes (no restart needed)",
+    "appearance.refreshed": "Theme list refreshed",
     "appearance.tone_dark": "Dark",
     "appearance.tone_light": "Light",
     # ---- Appearance theme gallery (v1.0.19: tabs + card grid + attribution) ----
@@ -866,6 +869,27 @@ EN_TEXT: dict[str, str] = {
     "msg.backup_exported": "Backup exported",
     "msg.delete_failed": "Delete failed",
     "msg.backup_deleted": "Backup deleted",
+    # ---- New display keys (v1.0.35 English-UI completion: engine rows/note,
+    # welcome status values, settings supported-systems value) ----
+    "row.installed_pkg": "Installed packages",
+    "engine.note": (
+        "Install/uninstall runs apt via pkexec with elevated privileges; "
+        "the full output appears live on the Logs page."
+    ),
+    "welcome.running": " (running)",
+    "welcome.no_frontend_running": "No running input method framework detected",
+    "welcome.env_skip": "No framework running; check skipped",
+    "welcome.env_ok": "All correct",
+    "welcome.env_bad": "Mismatch: {items}",
+    "welcome.next_engine": "Next: open Engine and install the RIME input method engine",
+    "welcome.summary": "Current status: {state}",
+    "state.no_engine": "Engine not installed",
+    "state.engine_ready": "Engine installed, schemas pending",
+    "state.schemes_installed": "Schemas installed, deployment pending",
+    "state.deployed": "Deployed and ready",
+    "settings.supported_systems_value": (
+        "Ubuntu 24.04+ / Linux Mint 22+ / Deepin 25.2+ (X11 / Wayland)"
+    ),
     # ---- 语言 ----
     "lang.zh_CN": "简体中文",
     "lang.en_US": "English",

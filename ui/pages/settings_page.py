@@ -327,7 +327,7 @@ class SettingsPage(PageBase):
         self.meta_keys: dict[str, tuple[CaptionLabel, str]] = {}
         self.frontend_value = BodyLabel("—")
         self.author_value = BodyLabel(config.AUTHOR)
-        self.supported_value = _ElidedLabel(config.SUPPORTED_SYSTEMS)
+        self.supported_value = _ElidedLabel(i18n.tr("settings.supported_systems_value"))
         # v1.0.30：「当前系统」列——运行时探测 + 版本通配判定（core/compat）。
         # 与写死的「适用系统」互补：未来系统升级后这里自动显示实际版本与
         # 判定结果，不再需要为新版本改代码。
@@ -550,7 +550,7 @@ class SettingsPage(PageBase):
             widget.setStyleSheet(f"color: {pal['text']};")
 
         self.frontend_value.setText(report.recommended_frontend or "—")
-        self.supported_value.set_full_text(config.SUPPORTED_SYSTEMS)
+        self.supported_value.set_full_text(i18n.tr("settings.supported_systems_value"))
         self.current_system_value.set_full_text(self._current_system_text(report))
         self._fill_theme_items()
 

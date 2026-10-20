@@ -16,3 +16,7 @@ resources/plum/package/
 # 临时预览图与下载的上游主题包，不属于源码仓库
 preview-*.png
 fcitx5-mellow-themes-main.zip
+
+# 商店上架素材（截图/文案/抓图脚本），不属于源码仓库；README 用的规范化
+# 截图在 docs/screenshots/，由 store-assets 的图导出
+store-assets/

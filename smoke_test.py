@@ -212,6 +212,14 @@ def check_icon_set() -> list[str]:
             errors.append(
                 "build-deb.sh 整体排除了 packaging/：装机后设置页 Hero 图标会缺失"
             )
+        # v1.0.36：开发/运营物料不得入包（store-assets 为 v1.0.35 后新建，
+        # 排除名单漏了它，连带 docs/图片/故障日志 三个历史遗漏目录一起打进
+        # deb，白增约 11.4MB 且把内部抓图脚本发给用户）
+        for stray in ("store-assets", "docs", "图片", "故障日志"):
+            if f"--exclude='./{stray}'" not in text:
+                errors.append(
+                    f"build-deb.sh 未排除开发/运营物料目录: ./{stray}"
+                )
     return errors
 
 
@@ -4882,6 +4890,16 @@ def check_window() -> list[str]:
             if settings.language_combo.count() != len(i18n.languages()):
                 errors.append(f"语言下拉项数异常: {settings.language_combo.count()}")
             en_index = i18n.languages().index(i18n.EN)
+            # 持久化偏好已是 en_US 的机器上，combo 启动就停在英文位，
+            # setCurrentIndex(en) 是无变化操作、currentIndexChanged 不触发，
+            # 后续「切英文」断言全部假失败（2026-10-20 实测：偏好被早前
+            # 冒烟运行污染成 en_US，窗口检查 10 项假失败）。先切到中文位
+            # 保证一次真实变化信号，再切英文。
+            if settings.language_combo.currentIndex() == en_index:
+                settings.language_combo.setCurrentIndex(
+                    i18n.languages().index(i18n.ZH)
+                )
+                app.processEvents()
             settings.language_combo.setCurrentIndex(en_index)
             app.processEvents()
             if i18n.load_preference() != i18n.EN:
@@ -5219,7 +5237,7 @@ def main() -> int:
 
     failures += check_resources()
 
-    assert config.VERSION == "1.0.35", "版本号与执行计划不一致"
+    assert config.VERSION == "1.0.36", "版本号与执行计划不一致"
     config.ensure_user_dirs()
     for d in (
         config.USER_DATA_DIR,

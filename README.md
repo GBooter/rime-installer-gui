@@ -2,7 +2,7 @@
 
 一款面向 **Ubuntu / Linux Mint / Deepin** 的 RIME（中州韵）图形化安装与管理工具。把「装引擎、装方案、配环境、换皮肤、备份恢复、干净卸载」这条原本全靠命令行的链路，收进一个 PyQt6 + Fluent 风格的单窗口程序里。
 
-![version](https://img.shields.io/badge/version-1.0.35-blue)
+![version](https://img.shields.io/badge/version-1.0.36-blue)
 ![platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B%20%7C%20Mint%2022%2B%20%7C%20Deepin%2025.2%2B-2ea44f)
 ![display](https://img.shields.io/badge/display-X11%20%2F%20Wayland-9cf)
 ![license](https://img.shields.io/badge/license-GPL--3.0-orange)

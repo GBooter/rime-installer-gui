@@ -19,6 +19,14 @@ from ui.pages.base import PageBase
 
 _SESSION_LABELS = {"x11": "X11", "wayland": "Wayland", "unknown": "未能识别"}
 
+#: 安装状态机 → i18n 键（底部摘要行的状态值；state_machine 的 .value 是中文源文案）
+_STATE_KEYS = {
+    InstallerState.NO_ENGINE: "state.no_engine",
+    InstallerState.ENGINE_READY: "state.engine_ready",
+    InstallerState.SCHEMES_INSTALLED: "state.schemes_installed",
+    InstallerState.DEPLOYED: "state.deployed",
+}
+
 #: 行标识 → i18n 键（左列标签；值列由 _fill 填入检测结果）
 _ROW_KEYS = {
     "os": "row.os",
@@ -68,32 +76,46 @@ class WelcomePage(PageBase):
             i18n.tr("status.unknown") if desktop == "unknown" else desktop,
         )
         if report.active_frontend:
-            frontend = f"{report.active_frontend}（运行中）"
+            frontend = f"{report.active_frontend}{i18n.tr('welcome.running')}"
             status = "ok"
         elif report.running_frontends:
             frontend = "、".join(report.running_frontends)
             status = "ok"
         else:
-            frontend = "未检测到运行中的输入法框架"
+            frontend = i18n.tr("welcome.no_frontend_running")
             status = "warn"
         self._set("frontend", frontend, status)
         if report.engine_installed:
-            self._set("engine", "已安装：" + "、".join(report.installed_engine_packages), "ok")
+            self._set(
+                "engine",
+                f"{i18n.tr('status.installed')}: "
+                + "、".join(report.installed_engine_packages),
+                "ok",
+            )
         else:
-            self._set("engine", "未安装", "bad")
+            self._set("engine", i18n.tr("status.not_installed"), "bad")
         self._set("rime_dir", str(report.rime_user_dir or "—"), "muted")
         if report.env_vars_ok is None:
-            self._set("env", "无框架运行，跳过检查", "muted")
+            self._set("env", i18n.tr("welcome.env_skip"), "muted")
         elif report.env_vars_ok:
-            self._set("env", "全部正确", "ok")
+            self._set("env", i18n.tr("welcome.env_ok"), "ok")
         else:
-            self._set("env", "异常：" + "、".join(report.env_var_mismatches), "bad")
+            self._set(
+                "env",
+                i18n.tr(
+                    "welcome.env_bad",
+                    items="、".join(report.env_var_mismatches),
+                ),
+                "bad",
+            )
 
         state = self._sm.state
         if state is InstallerState.NO_ENGINE:
-            self.summary_label.setText("下一步：前往「引擎安装」安装中州韵输入法引擎")
+            self.summary_label.setText(i18n.tr("welcome.next_engine"))
         else:
-            self.summary_label.setText(f"当前状态：{state.value}")
+            self.summary_label.setText(
+                i18n.tr("welcome.summary", state=i18n.tr(_STATE_KEYS[state]))
+            )
 
     def _set(self, key: str, value: str, status: str | None = None) -> None:
         row: QHBoxLayout = self._rows[key]  # type: ignore[assignment]

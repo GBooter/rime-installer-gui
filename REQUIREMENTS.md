@@ -844,3 +844,31 @@ launcher.log 里每次崩溃都是 `退出码=134`（SIGABRT）+ 同一行 stder
 - 负向对照：把 `FRONTEND_EXTRA_PACKAGES` 置空（=修复前）→ 断言报错；给 ibus 也塞该包（=串味）→ 断言报错。证明测试咬住两个方向。
 - 实跑生成的安装脚本人工核对：`{ update || echo; } && install fcitx-rime && { librime-bin || echo; } && { fcitx-config-gtk || echo; }`，单步单次 pkexec、nice/ionice 降级保持。
 - 对 fcitx5 的影响：无。门控只在 `frontend == "fcitx-rime"` 时追加；fcitx5 路径的引擎安装、重启（`fcitx5 -d`）、配置工具（`fcitx5-configtool`，随 fcitx5 包 Recommends 装上）全部不变，冒烟断言②固化这一点。
+
+## v1.0.36 — i18n 补全（英文商店截图暴露的硬编码中文）
+
+**用户诉求**：应用上架商店需英文界面截图；截图发现切到 English 后多个页面仍显示中文。
+
+**根因**：`core/i18n.py` 的 `tr` 机制本身健全（缺键回退中文），但一批**展示层字符串绕过了 i18n**，在代码里硬编码中文：引擎页 4 个行标签（引擎状态/已安装包/目标前端/配置目录）与「已安装：」状态值、pkexec 脚注；欢迎页运行中/未检测到/已安装/全部正确/异常等状态值与底部「当前状态」摘要（`InstallerState` 枚举值直出）；设置页「适用系统」值。EN 包另有 3 个「刷新主题目录」相关键缺失（外观页按钮会漏中文）。
+
+**落地**：
+
+1. `core/i18n.py` + `core/translations/en.py`：新增 13 对中英对称键——`status.installed` / `status.not_installed` / `status.unknown`、`row.installed_pkg`、`engine.note`、`welcome.running` / `welcome.no_frontend_running` / `welcome.env_skip`、`state.no_engine` / `state.engine_ready` / `state.schemes_installed` / `state.deployed`（安装状态机 4 态）、`settings.supported_systems_value`；EN 包另补 `appearance.open_themes_dir` / `appearance.open_themes_dir_tip` / `appearance.theme_note` 3 键。
+2. `ui/pages/engine_page.py`：行标签、状态值（`{已安装}: xxx` 拼接）、脚注改走 `i18n.tr`。
+3. `ui/pages/welcome_page.py`：新增 `_STATE_KEYS` 映射（`InstallerState` 4 态 → `state.*` 键），前端/引擎/环境变量状态值与底部摘要全部走 i18n。
+4. `ui/pages/settings_page.py`：「适用系统」值改 `i18n.tr("settings.supported_systems_value")`（不再直出 `config.SUPPORTED_SYSTEMS`）。
+5. 版本 1.0.35 → 1.0.36（config / smoke 断言 / README 徽章同步）。
+
+**打包卫生（v1.0.36 构建时发现并修复）**：`build-deb.sh` 的 tar 排除名单漏掉 4 个非运行时目录——`store-assets/`（商店截图/文案/抓图脚本，v1.0.35 之后新建）、`docs/`（README 截图 2.4MB）、`图片/`（开发期截图 dump 5.3MB）、`故障日志/`（真机日志 100KB），运行时零引用（grep 核过）却被打进 deb，白增约 11.4MB 且把内部抓图脚本发给用户。已在 tar 排除行补上这 4 项，deb 从 25.8MB 降到 14.9MB；`smoke_test.check_resources` 新增断言「这 4 个目录必须出现在排除行」（负向对照：删掉任一排除行断言即报错）。
+
+**冒烟测试修复（v1.0.36 构建时发现并修复）**：`check_window` 的语言切换段假设 combo 起始位不是英文——真机偏好被早前运行污染成 `en_US` 后，`setCurrentIndex(en)` 是无变化操作、`currentIndexChanged` 不触发，语言切换整段静默失效，10 项「切英文」断言假失败（整轮冒烟在 appearance 清理阶段就被钩子杀，window 排在后面，此类失败只有补跑脚本能暴露）。修法：切英文前若 combo 已在英文位，先切到中文位保证一次真实变化信号。另：本次已将真机 `~/.config/rime-installer` 的 language 偏好从测试污染的 `en_US` 还原为 `zh_CN`。
+
+**已知限制（未在本次解决）**：方案市场卡片数据（`core/schemes.py` 的 `name` / `desc` / ` pros`）为硬编码中文、不走 i18n，英文界面下仍是中文——需方案数据层做一层英文翻译，工作量较大，后续版本处理；apt 镜像名称（官方源/阿里云等，属品牌名数据）与「自定义源」当前源显示同理，影响很小。
+
+**验证**：
+
+- 键集对称校验：`set(ZH_TEXT) == set(EN_TEXT)`（`doctor.check.*` 仅 EN 为既定设计，中文走 `tr_or` 字面量回退），无单边键。
+- 三页可导入、可离屏构建无崩溃；英文实机截图（Xvfb + `i18n.set_language(en_US)`）人工核验：欢迎/引擎/外观/备份/诊断/设置 6 页全英文，标题栏 `RIME Installer v1.0.36`。
+- `smoke_test.py` 无断言依赖被替换的旧字符串（第 703 行「配置目录」为状态机 reason 文案，未动）。
+- 冒烟全量（`.venv/bin/python`，注意不能用 `/usr/bin/python3`——无 qfluentwidgets，theme 检查会假失败）：整轮跑过 appearance 清理阶段被 safe-delete 钩子杀（环境限制，已过项全部 OK）；剩余 12 项经 `tools/rerun_flow_checks.py` 分批补跑全过（含修复后的 window）。
+- deb 入库验证：`.venv` 0 条、图标 8 档、白名单 tools 恰 3 脚本、control 版本/架构/Depends 正确、与 v1.0.35 清单 diff 仅移除 34 条物料条目、零新增。

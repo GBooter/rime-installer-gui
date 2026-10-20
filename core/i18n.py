@@ -499,6 +499,24 @@ ZH_TEXT = {
     "msg.backup_exported": "备份已导出",
     "msg.delete_failed": "删除失败",
     "msg.backup_deleted": "备份已删除",
+    # ---- 新增展示键（v1.0.35 英文界面补全：引擎页行标签/脚注、欢迎页状态值、设置页适用系统值） ----
+    "row.installed_pkg": "已安装包",
+    "engine.note": "安装/卸载经 pkexec 提权执行 apt，完整输出可在「日志」页实时查看。",
+    "welcome.running": "（运行中）",
+    "welcome.no_frontend_running": "未检测到运行中的输入法框架",
+    "welcome.env_skip": "无框架运行，跳过检查",
+    "welcome.env_ok": "全部正确",
+    "welcome.env_bad": "异常：{items}",
+    "welcome.next_engine": "下一步：前往「引擎安装」安装中州韵输入法引擎",
+    "welcome.summary": "当前状态：{state}",
+    "state.no_engine": "引擎未安装",
+    "state.engine_ready": "引擎已安装，待装方案",
+    "state.schemes_installed": "方案已安装，待部署",
+    "state.deployed": "部署就绪",
+    # 值与 config.SUPPORTED_SYSTEMS 保持一致（展示层副本，改版本时需同步）
+    "settings.supported_systems_value": (
+        "Ubuntu 24.04 及以上 / Linux Mint 22 及以上 / Deepin 25.2 及以上（X11 / Wayland）"
+    ),
     # ---- 语言 ----
     "lang.zh_CN": "简体中文",
     "lang.en_US": "English",

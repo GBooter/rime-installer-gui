@@ -42,10 +42,10 @@ class EnginePage(ProgressAreaMixin, PageBase):
         self._report = report
         self._sm = sm
 
-        self.status_row = self.add_row("引擎状态", "")
-        self.pkg_row = self.add_row("已安装包", "")
-        self.frontend_row = self.add_row("目标前端", "")
-        self.rime_dir_row = self.add_row("配置目录", "")
+        self.status_row = self.add_row(i18n.tr("row.engine"), "")
+        self.pkg_row = self.add_row(i18n.tr("row.installed_pkg"), "")
+        self.frontend_row = self.add_row(i18n.tr("row.frontend"), "")
+        self.rime_dir_row = self.add_row(i18n.tr("row.rime_dir"), "")
 
         options = QHBoxLayout()
         options.setSpacing(16)
@@ -89,9 +89,7 @@ class EnginePage(ProgressAreaMixin, PageBase):
         # 进度区（执行期间显示；等待态条纹 + 数值平滑动画见 ProgressAreaMixin）
         self._init_progress_area(self.card_layout)
 
-        self.note_label = CaptionLabel(
-            "安装/卸载经 pkexec 提权执行 apt，完整输出可在「日志」页实时查看。"
-        )
+        self.note_label = CaptionLabel(i18n.tr("engine.note"))
         self.layout().addWidget(self.note_label)
 
         self._status_base = ""
@@ -109,7 +107,9 @@ class EnginePage(ProgressAreaMixin, PageBase):
         installed = report.installed_engine_packages
         self._set_row(
             self.status_row,
-            "已安装：" + "、".join(installed) if installed else "未安装",
+            f"{i18n.tr('status.installed')}: " + "、".join(installed)
+            if installed
+            else i18n.tr("status.not_installed"),
             "ok" if installed else "bad",
         )
         self._set_row(self.pkg_row, "、".join(installed) or "—", "muted")

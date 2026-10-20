@@ -14,7 +14,7 @@ from pathlib import Path
 APP_NAME = "中州韵输入法安装器"
 APP_NAME_EN = "RIME Installer"
 APP_ID = "rime-installer"
-VERSION = "1.0.35"
+VERSION = "1.0.36"
 AUTHOR = "Feelup"
 # 适用系统：实测最低版本 + 显示服务端（X11 / Wayland）。
 # v1.0.30：改为**区间式**（下限定死、上沿不封顶）——版本通配判定见

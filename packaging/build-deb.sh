@@ -45,6 +45,11 @@ mkdir -p "$BUILD/DEBIAN" "$BUILD/usr/lib/rime-installer" \
 # packaging/ 只排除构建脚本与 desktop 源文件：icons/ 是运行时资源（config.APP_LOGO
 # 设置页 Hero 高清图标指向 packaging/icons/rime-installer-512.png，v1.0.27 曾整目录
 # 排除，装机后该路径缺失只能回退主题图标），必须随应用树发布。
+# v1.0.36：docs/（README 引用的实机截图 2.4MB）、图片/（开发期截图 dump 5.3MB）、
+# 故障日志/（真机故障日志 100KB）、store-assets/（商店上架素材：截图/文案/抓图脚本
+# 3.7MB）同属开发/运营物料，运行时零引用（grep 核过），排除——v1.0.36 构建时发现
+# 这四个目录被打进 deb（store-assets 为 v1.0.35 之后新建，排除名单未覆盖），
+# 白增约 11.4MB 且把内部抓图脚本发给用户。
 cd "$ROOT"
 tar --exclude='./build' --exclude='./.git' --exclude='./.workbuddy' \
     --exclude='./rayburst-main' --exclude='./.venv' \
@@ -57,6 +62,8 @@ tar --exclude='./build' --exclude='./.git' --exclude='./.workbuddy' \
     --exclude='./packaging/build-deb.sh' --exclude='./packaging/rime-installer.desktop' \
     --exclude='./smoke_test.py' --exclude='./.gitignore' \
     --exclude='./REQUIREMENTS.md' --exclude='./design' \
+    --exclude='./docs' --exclude='./图片' --exclude='./故障日志' \
+    --exclude='./store-assets' \
     --exclude='./New-Logo.png' --exclude='./preview-*.png' \
     --exclude='./.smoke-out.log' --exclude='./.smoke-*.log' \
     --exclude='./fcitx5-mellow-themes-main.zip' -cf - . | tar -xmf - -C "$BUILD/usr/lib/rime-installer"
