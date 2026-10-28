@@ -28,7 +28,7 @@ from PyQt6.QtGui import QCloseEvent, QDesktopServices, QIcon
 from PyQt6.QtWidgets import QDialog
 
 import config
-from core import appearance, i18n, im_env, theme
+from core import appearance, candidate_count, i18n, im_env, residue, theme
 from core.apt_mirror import build_switch_steps, mirrors
 from core.deploy_guide import (
     build_open_config_tool_steps,
@@ -56,6 +56,12 @@ from core.scheme_service import (
     package_tree_hash,
 )
 from core.schemes import SCHEME_MAP, SCHEMES, Scheme, custom_scheme, parse_spec
+# 注意别名：apt_mirror 已有同名 build_switch_steps（镜像切换），不可覆盖
+from core.schema_switch import (
+    build_switch_steps as build_schema_switch_steps,
+    detect_active_schema,
+    list_switchable,
+)
 from core.theme_import import diagnose_repo as diagnose_theme_repo
 from core.theme_import import enumerate_themes as enumerate_import_themes
 from core.theme_import import install_all as install_import_themes
@@ -183,6 +189,8 @@ class MainWindow(MSFluentWindow):
         self._theme_delete_reset = False
         # v1.0.12：当前生效皮肤的方案 key（detect_active_skin 反读）
         self._active_skin_key = ""
+        # v1.0.38：可切换方案缓存（schema_switch.SwitchableSchema；_refresh_switchable 维护）
+        self._switchable: list = []
 
         self.welcome_page = WelcomePage(self.report, self.sm, on_redetect=self.redetect_async)
         self.engine_page = EnginePage(self.report, self.sm)
@@ -211,6 +219,8 @@ class MainWindow(MSFluentWindow):
 
         self.engine_page.install_requested.connect(self._on_install_requested)
         self.engine_page.uninstall_requested.connect(self._on_uninstall_requested)
+        # v1.0.37：手动安装残留清理（引擎页入口，chown 需密码故不走一键修复）
+        self.engine_page.residue_clean_requested.connect(self._on_residue_clean)
         self.engine_page.cancel_requested.connect(self.runner.cancel)
         self.engine_page.log_requested.connect(lambda: self.switchTo(self.log_page))
 
@@ -229,6 +239,9 @@ class MainWindow(MSFluentWindow):
         self.appearance_page.theme_import_requested.connect(self._on_theme_import)
         self.appearance_page.ibus_style_requested.connect(self._on_ibus_style)
         self.appearance_page.ibus_revert_requested.connect(self._on_ibus_revert)
+        # v1.0.41：候选词数量（menu/page_size）
+        self.appearance_page.page_size_requested.connect(self._on_page_size)
+        self.appearance_page.page_size_revert_requested.connect(self._on_page_size_revert)
         self.appearance_page.open_themes_dir_requested.connect(self._on_open_themes_dir)
         self.appearance_page.link_requested.connect(self._on_open_link)
         self.appearance_page.cancel_requested.connect(self.runner.cancel)
@@ -257,6 +270,8 @@ class MainWindow(MSFluentWindow):
         self.settings_page.theme_change_requested.connect(self._on_theme_change)
         self.settings_page.language_change_requested.connect(self._on_language_change)
         self.settings_page.log_requested.connect(lambda: self.switchTo(self.log_page))
+        # v1.0.38：方案切换（卡片「启用」/ 已安装方案快捷条）
+        self.scheme_page.switch_requested.connect(self._on_schema_switch)
 
         self._wire_runner()
         # v1.0.12：启动即反读一次皮肤当前态（配置 + 默认偏好）
@@ -295,8 +310,12 @@ class MainWindow(MSFluentWindow):
         v1.0.26：体检相关任务必须回到环境修复页。旧实现一律回落到
         scheme_page——点「一键修复」后进度条、状态文字、可用的「取消」都
         出现在「方案市场」页，本页毫无反馈（离屏实测取证）。
+
+        v1.0.37：残留清理任务回到引擎页（入口按钮在那里）。
         """
         if self._engine_kind():
+            return self.engine_page
+        if self._task_kind.startswith("residue"):
             return self.engine_page
         if self._task_kind.startswith("backup"):
             return self.backup_page
@@ -354,6 +373,75 @@ class MainWindow(MSFluentWindow):
             return
         self._purge_after_uninstall = purge_user_data_flag
         self._start_task("engine-uninstall", build_uninstall_steps(frontend))
+
+    # ---- 手动安装残留清理（v1.0.37） ----
+
+    def _on_residue_clean(self, items: list) -> None:
+        """引擎页「清理残留」：确认框列清每步动作 → runner 执行。
+
+        与「一键修复」分开的原因：chown 要管理员密码，塞进静默修复流里
+        会在用户没预期时弹密码框；且清理动作（改属主/删引用行）值得一次
+        醒目的、逐条列明的确认。备份步骤与 chown/yaml 清理同属一个任务，
+        任一步失败即整体中止——绝不做一半。
+        """
+        rime_dir = self.report.rime_user_dir
+        if rime_dir is None:
+            InfoBar.error(
+                title=i18n.tr("msg.no_rime_dir"),
+                content=i18n.tr("msg.no_rime_dir_hint"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
+            return
+        auto = residue.cleanable(items)
+        if not auto:
+            InfoBar.info(
+                title=i18n.tr("residue.none"),
+                content=i18n.tr("engine.clean_residue_tip"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=5000,
+            )
+            return
+        tally = residue.counts(auto)
+        actions = []
+        # 备份步与实际构建同源判断：目录可读才备（root 700 目录读不了，
+        # 备份必然失败，那种场景直接进 chown）
+        if residue.dir_readable(rime_dir):
+            actions.append(i18n.tr("msg.residue_action_backup"))
+        if tally.get(residue.FOREIGN_OWNER):
+            actions.append(
+                i18n.tr("msg.residue_action_chown", n=tally[residue.FOREIGN_OWNER])
+            )
+        if tally.get(residue.STALE_SCHEMA):
+            actions.append(
+                i18n.tr("msg.residue_action_yaml", n=tally[residue.STALE_SCHEMA])
+            )
+        if tally.get(residue.STAGING):
+            actions.append(i18n.tr("msg.residue_action_staging"))
+        manual = len(items) - len(auto)
+        body = i18n.tr(
+            "msg.residue_confirm_body",
+            actions="\n".join(actions),
+            manual=i18n.tr("msg.residue_manual_note", n=manual) if manual else "",
+        )
+        box = MessageBox(i18n.tr("msg.residue_confirm"), body, self)
+        if not box.exec():
+            return
+        steps = residue.build_clean_steps(
+            items, rime_dir, self.report.effective_frontend
+        )
+        if not steps:
+            InfoBar.info(
+                title=i18n.tr("residue.none"),
+                content=i18n.tr("engine.clean_residue_tip"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=5000,
+            )
+            return
+        self._start_task("residue-clean", steps, running_key="residue")
 
     # ---- 方案任务 ----
 
@@ -621,6 +709,43 @@ class MainWindow(MSFluentWindow):
         steps = build_check_steps(scheme, work)
         self._pending = {"scheme": scheme, "work": work}
         self._start_task("scheme-check-update", steps, running_key=scheme.key)
+
+    # ---- 方案切换（v1.0.38） ----
+
+    def _on_schema_switch(self, schema_id: str) -> None:
+        """切换当前输入方案（core/schema_switch 构建步骤链）。
+
+        无破坏性（入列 + 写 user.yaml + 部署重启，两处 yaml 改前都留
+        .bak），与换皮肤一致不弹确认框；失败由 Step.hint_key 给定向提示。
+        """
+        rime_dir = self.report.rime_user_dir
+        if rime_dir is None:
+            InfoBar.error(
+                title=i18n.tr("msg.no_rime_dir"),
+                content=i18n.tr("msg.no_rime_dir_hint"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
+            return
+        try:
+            steps = build_schema_switch_steps(
+                schema_id, rime_dir, self.report.effective_frontend
+            )
+        except ValueError as exc:
+            InfoBar.error(
+                title=i18n.tr("msg.schema_switch_failed"),
+                content=str(exc),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
+            return
+        name = next(
+            (s.name for s in self._switchable if s.id == schema_id), schema_id
+        )
+        self._pending = {"schema_id": schema_id, "schema_name": name}
+        self._start_task("scheme-switch", steps, running_key=schema_id)
 
     def _report_update_check(self) -> None:
         scheme: Scheme | None = self._pending.get("scheme")
@@ -946,6 +1071,54 @@ class MainWindow(MSFluentWindow):
         steps = appearance.build_ibus_revert_steps(rime_dir)
         self._start_task("appearance-ibus-revert", steps, running_key="ibus-revert")
 
+    # ---- 候选词数量（v1.0.41：rime 的 menu/page_size） ----
+
+    def _on_page_size(self, size: int) -> None:
+        """把候选词数量写进 rime 配置并重新部署（写 yaml → 编译 → 重启框架）。
+
+        不弹确认框：改的是可逆的用户配置（改前留 .rime-installer-bak），
+        与「换主题 / 切方案」同一处理方式。写操作覆盖全局 patch + 方案级
+        补丁（后者由 core/candidate_count.write_page_size 自行判定）。
+        """
+        rime_dir = self.report.rime_user_dir
+        if rime_dir is None:
+            InfoBar.error(
+                title=i18n.tr("appearance.ibus_no_dir"),
+                content=i18n.tr("appearance.ibus_note"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
+            return
+        value = candidate_count.clamp(size)
+        self._pending = {"page_size": value}
+        steps = candidate_count.build_apply_steps(
+            value, rime_dir, self.report.effective_frontend
+        )
+        self._start_task(
+            "appearance-page-size", steps, running_key=f"page-size-{value}"
+        )
+
+    def _on_page_size_revert(self) -> None:
+        """移除安装器写入的候选数配置（回到方案 / 引擎自带的值）并重新部署。"""
+        rime_dir = self.report.rime_user_dir
+        if rime_dir is None:
+            InfoBar.error(
+                title=i18n.tr("appearance.ibus_no_dir"),
+                content=i18n.tr("appearance.ibus_note"),
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=6000,
+            )
+            return
+        self._pending = {}
+        steps = candidate_count.build_revert_steps(
+            rime_dir, self.report.effective_frontend
+        )
+        self._start_task(
+            "appearance-page-size-revert", steps, running_key="page-size-default"
+        )
+
     # ---- 打开主题目录（v1.0.16 市场移除后的自制主题落地入口） ----
 
     def _on_open_themes_dir(self) -> None:
@@ -1156,6 +1329,21 @@ class MainWindow(MSFluentWindow):
                 self._commit_skin_apply()
             elif kind == "scheme-check-update":
                 self._report_update_check()
+            elif kind == "scheme-switch":
+                # v1.0.38：方案切换完成。提示里点名方案——切换已重启框架，
+                # 当前输入上下文重建后即刻生效。
+                name = (
+                    self._pending.get("schema_name")
+                    or self._pending.get("schema_id")
+                    or ""
+                )
+                InfoBar.success(
+                    title=i18n.tr("msg.schema_switched"),
+                    content=i18n.tr("msg.schema_switched_hint", name=name),
+                    parent=self,
+                    position=InfoBarPosition.TOP,
+                    duration=6000,
+                )
             elif kind == "appearance-import":
                 self._commit_theme_import()
 
@@ -1232,6 +1420,16 @@ class MainWindow(MSFluentWindow):
                     position=InfoBarPosition.TOP,
                     duration=6000,
                 )
+            elif kind == "residue-clean":
+                # v1.0.37：残留清理完成。提示里引导再部署一次——修属主/
+                # 删引用行之后，build 还是旧的，要重新部署才生效。
+                InfoBar.success(
+                    title=i18n.tr("msg.residue_cleaned"),
+                    content=i18n.tr("msg.residue_cleaned_hint"),
+                    parent=self,
+                    position=InfoBarPosition.TOP,
+                    duration=6000,
+                )
             elif kind == "doctor-write-login":
                 InfoBar.success(
                     title=i18n.tr("msg.login_written"),
@@ -1303,6 +1501,24 @@ class MainWindow(MSFluentWindow):
                     position=InfoBarPosition.TOP,
                     duration=6000,
                 )
+            elif kind in ("appearance-page-size", "appearance-page-size-revert"):
+                if kind.endswith("revert"):
+                    InfoBar.success(
+                        title=i18n.tr("msg.page_size_reverted"),
+                        content=i18n.tr("msg.page_size_reverted_hint"),
+                        parent=self,
+                        position=InfoBarPosition.TOP,
+                        duration=6000,
+                    )
+                else:
+                    size = self._pending.get("page_size") or candidate_count.PAGE_SIZE_DEFAULT
+                    InfoBar.success(
+                        title=i18n.tr("msg.page_size_applied", n=size),
+                        content=i18n.tr("msg.page_size_applied_hint"),
+                        parent=self,
+                        position=InfoBarPosition.TOP,
+                        duration=6000,
+                    )
             elif kind == "engine-uninstall":
                 content = i18n.tr(
                     "msg.engine_uninstalled_hint", pkg=engine_package(frontend)
@@ -1392,6 +1608,43 @@ class MainWindow(MSFluentWindow):
             self._active_skin_key, self.manifest.get_default_skin()
         )
 
+    def _refresh_switchable(self) -> None:
+        """v1.0.39：刷新方案页的「当前方案」切换器与卡片切换态。
+
+        schema_id 映射来自 manifest 的 files 记录（安装时记账，顺序即安装
+        顺序）——卡片据此显示「启用」按钮与「当前方案」徽标，切换器据此
+        把可切换方案**按方案包分组**（v1.0.39）；扫盘再补上手动安装与
+        共享目录里的方案（只切换、不卸载）。当前方案反读 user.yaml——
+        用户在现场 Ctrl+` 切换后 rime 自己维护该文件，反读依然准确，
+        比任何安装器侧记账都可靠。
+
+        **调用顺序**：先 set_schema_ids（注入包归属）再 set_switchable_state
+        ——反过来的话，第一次刷新时包归属还是空的，分组会退化成按来源平铺。
+        """
+        rime_dir = self.report.rime_user_dir
+        if rime_dir is None:
+            self._switchable = []
+            self.scheme_page.set_schema_ids({})
+            self.scheme_page.set_switchable_state([], "")
+            return
+        installer_ids: set[str] = set()
+        mapping: dict[str, list[str]] = {}
+        for key in self.manifest.installed_keys():
+            ids = [
+                path[: -len(".schema.yaml")]
+                for path in self.manifest.package_files(key)
+                if path.endswith(".schema.yaml")
+            ]
+            mapping[key] = ids
+            installer_ids.update(ids)
+        items = list_switchable(rime_dir, installer_ids=installer_ids)
+        self._switchable = items
+        # 先注入包归属（分组依据），再刷新切换器
+        self.scheme_page.set_schema_ids(mapping)
+        self.scheme_page.set_switchable_state(
+            items, detect_active_schema(rime_dir)
+        )
+
     # ---- 检测分发 ----
 
     def redetect(self) -> None:
@@ -1463,7 +1716,7 @@ class MainWindow(MSFluentWindow):
     def _refresh_status(self) -> None:
         """状态信息刷新（当前由欢迎页摘要 + 各页状态行承担，此处为扩展钩子）。
 
-        v1.0.5：删除窗口级 setToolTip——鼠标悬停任意空白处即弹出
-        「状态：… ｜ 推荐前端：…」长条提示（真机反馈属干扰）。
+        v1.0.38：方案切换态在此刷新——_refresh_status 在启动尾声与每次
+        _dispatch 后都会跑到，是「报告就绪后推状态」的自然时机。
         """
-        return
+        self._refresh_switchable()

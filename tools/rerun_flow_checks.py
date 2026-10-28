@@ -49,11 +49,15 @@ ALL_CHECKS: dict[str, object] = {
     "animation": smoke.check_animation,
     "skin_ui": smoke.check_skin_ui,
     "appearance_ui": smoke.check_appearance_ui,
+    # v1.0.41：候选词数量（menu/page_size）核心读写 + 页面回填/意图
+    "candidate_count": smoke.check_candidate_count,
     "skin_flow": smoke.check_skin_flow,
     "appearance_flow": smoke.check_appearance_flow,
     "runner": smoke.check_runner,
     "scheme_install_flow": smoke.check_scheme_install_flow,
     "snapshot_cli": smoke.check_snapshot_cli,
+    # v1.0.37：残留清理端到端（真删文件，独立进程跑避开删除配额）
+    "residue_clean": smoke.check_residue_clean,
 }
 #: 需要 QApplication 的检查（window 负责建 app，必须排在它们之前）
 _QWIDGET_CHECKS = frozenset(ALL_CHECKS) - {"snapshot_service", "appearance", "theme_import"}

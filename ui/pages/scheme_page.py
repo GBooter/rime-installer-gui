@@ -1,15 +1,30 @@
 """方案市场页（Phase 3）：方案卡片（介绍/优势/来源）+ aria2 加速安装 + 卸载 + 更新检查。
 
+v1.0.39：重构「已安装方案切换」的交互（真机反馈「方式感觉不太好」）。
+v1.0.38 的一版把 21 个 schema 平铺成胶囊墙，问题有三：
+1. 状态卡里的「当前方案」行与胶囊墙的高亮项表达同一件事（两套视觉语言）；
+2. 胶囊墙的粒度是 **文件**（``*.schema.yaml``）不是 **方案包**——一个包
+   带出多个变体（朙月拼音 → 简化字/慕潮正體/語句流），用户看到的是一堆
+   碎片，不是「我装了哪些方案」；
+3. 胶囊墙夹在状态卡与筛选工具栏之间，破坏页面动线，且把市场卡片挤到
+   折叠线以下。
+
+改为：**状态卡内一行「当前方案」切换器**（唯一事实源，当前项带 ✓）+
+**下拉菜单**（按方案包分组、组标题=包名、顶部可搜索、当前项 ✓ 勾选）。
+卡片上的「启用」按钮接管主路径：点它即把该包主方案设为当前。
+详见 core/schema_switch.group_by_package。
+
 本页只负责展示与意图发射，执行由主窗口编排：
 - install_requested(key)：安装/重装走同一条 aria2 + plum 流水线；
 - uninstall_requested(key)：依赖 manifest 快照做干净卸载；
 - check_update_requested(key)：仅下载对比指纹，不改动用户目录；
+- switch_requested(schema_id)：切换当前输入方案（core/schema_switch 构建步骤）；
 - custom_install_requested(spec)：支持任意 user/repo[@branch][:recipe]。
 """
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
@@ -32,8 +47,10 @@ from qfluentwidgets import (
 from core.detector import EnvReport
 from core import i18n
 from core.schemes import SCHEME_MAP, SCHEMES, parse_spec, Scheme
+from core.schema_switch import group_by_package
 from core.state_machine import StateMachine
 from ui.pages.base import STATUS_COLORS, PageBase, ProgressAreaMixin
+
 
 #: 分类 → 语言键（值在运行时按当前语言取，切换语言可立即刷新）
 CATEGORY_KEYS = {
@@ -63,13 +80,150 @@ def filter_items() -> list[str]:
     return [i18n.tr(key) for key in FILTER_KEYS]
 
 
+class SchemaSwitcher(QWidget):
+    """「当前方案」下拉选择器（v1.0.40）。
+
+    **形态**：一个标准下拉框（``ComboBox``）——控件本身就显示当前正在使用
+    的方案名，带边框与下拉箭头，一眼能看出「这里能点」。
+
+    **为什么换掉 v1.0.39 的菜单**：那一版是「文字标签 + 32px 透明箭头
+    按钮 + 自定义 widget 菜单行」，真机反馈两处硬伤：①箭头太隐蔽，不点
+    不知道能点；②菜单项点击不触发（用户机上没有任何切换任务日志、
+    ``user.yaml`` 未被写）。自定义 widget 行依赖 qfluentwidgets
+    ``RoundMenu.addWidget`` 的 ``onClick`` 间接链路，在真实输入事件下
+    不可靠。改回 Qt 原生下拉后，选中项走 ``activated`` 信号（只在用户
+    操作时发），点击路径与页面「筛选」下拉完全一致。
+
+    **分组**：下拉列表里插入**禁用项**当方案包标题（``── 雾凇拼音 ──``），
+    点击无反应，把同一包的变体在视觉上收拢。
+
+    **唯一事实源**：控件显示的文本 = 实际生效方案（反读 user.yaml），
+    不再另设一行「当前方案」文字标签。
+    """
+
+    switch_requested = pyqtSignal(str)  # schema_id
+
+    #: 下拉框宽度（px）——够放下「注音·慕潮正體双拼」这类长名
+    WIDTH = 320
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._groups: list = []
+        self._active_id = ""
+        #: 下拉项索引 → schema_id（分组标题项为空串）
+        self._index_ids: list[str] = []
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.combo = ComboBox(self)
+        self.combo.setFixedWidth(self.WIDTH)
+        self.combo.setPlaceholderText(i18n.tr("scheme.switchable_none"))
+        #: 只在用户操作时发出（程序设值不发），避免重建时误触发切换
+        self.combo.activated.connect(self._on_activated)
+        layout.addWidget(self.combo)
+
+    # ---- 对外接口 ----
+
+    def set_state(self, groups, active_id: str) -> None:
+        """按分组重建下拉项，并把显示值同步到实际生效方案。
+
+        groups：``core.schema_switch.group_by_package`` 的结果；
+        active_id：当前生效的 schema_id（反读 user.yaml）。
+        """
+        self._groups = list(groups or [])
+        self._active_id = active_id or ""
+        self._rebuild()
+
+    def set_busy(self, busy: bool) -> None:
+        """执行期禁用下拉（切换任务在跑时不能再发一次切换）。"""
+        self.combo.setEnabled(not busy and bool(self._groups))
+
+    def retranslate(self) -> None:
+        """切语言：分组标题与占位文案都来自 i18n，重建即可。"""
+        self._rebuild()
+
+    def current_text(self) -> str:
+        """当前显示的方案名（无可用方案时为空串）。"""
+        return self.combo.currentText() if self.combo.currentIndex() >= 0 else ""
+
+    # ---- 内部 ----
+
+    def _rebuild(self) -> None:
+        combo = self.combo
+        combo.blockSignals(True)
+        combo.clear()
+        self._index_ids = []
+        target = -1
+        placeholder = i18n.tr("scheme.switchable_none")
+        combo.setPlaceholderText(placeholder)
+
+        for group in self._groups:
+            # 分组标题：禁用项（点击不触发），视觉上作分隔
+            combo.addItem(f"── {group.title} ──")
+            combo.items[-1].isEnabled = False
+            self._index_ids.append("")
+            for item in group.items:
+                label = item.name
+                # 当前生效项加 ✓：控件文本与下拉列表都能一眼看出「正在用哪个」
+                if item.id == self._active_id:
+                    label = f"✓ {label}"
+                if not item.in_list:
+                    label = f"{label}（{i18n.tr('scheme.not_in_list_short')}）"
+                combo.addItem(label, userData=item.id)
+                self._index_ids.append(item.id)
+                if item.id == self._active_id:
+                    target = combo.count() - 1
+
+        if target >= 0:
+            combo.setCurrentIndex(target)
+        else:
+            # 当前方案不在可切换列表里（例如手动装完没部署）——显示占位文案
+            combo.setCurrentIndex(-1)
+            combo.setText(placeholder)
+
+        combo.blockSignals(False)
+        combo.setEnabled(bool(self._groups))
+        combo.setToolTip(
+            i18n.tr("scheme.switcher_tip")
+            if self._groups
+            else placeholder
+        )
+
+    def _current_display(self) -> str:
+        for group in self._groups:
+            for item in group.items:
+                if item.id == self._active_id:
+                    return f"{item.name}（{item.id}）"
+        return self._active_id
+
+    def _on_activated(self, index: int) -> None:
+        """用户在下拉里选中一项（``activated`` 只在用户操作时发出）。"""
+        if not (0 <= index < len(self._index_ids)):
+            return
+        schema_id = self._index_ids[index]
+        if not schema_id:
+            # 兜底：误点分组标题（禁用项本不可选）——把显示拉回真实值
+            self._rebuild()
+            return
+        if schema_id != self._active_id:
+            self.switch_requested.emit(schema_id)
+
+
 class SchemeCard(SimpleCardWidget):
-    """单张方案卡：名称 + 分类徽标 + 简介 + 优势列表 + 来源体积 + 操作按钮。"""
+    """单张方案卡：名称 + 分类徽标 + 简介 + 优势列表 + 来源体积 + 操作按钮。
+
+    v1.0.38：非皮肤卡新增「启用」按钮（切换当前输入方案）与「当前方案」徽标。
+    卡片自身不知道 schema_id——由页面经 ``set_schema_ids`` 注入（manifest 的
+    files 记录推导），皮肤卡不走这条路（皮肤的「切换」就是 install_button）。
+    """
 
     install_requested = pyqtSignal(str)
     check_update_requested = pyqtSignal(str)
     uninstall_requested = pyqtSignal(str)
     set_default_requested = pyqtSignal(str)
+    switch_requested = pyqtSignal(str)  # schema_id
 
     def retranslate(self) -> None:
         """切语言：刷新分类徽标与操作按钮（皮肤用「切换/移除」语义）。"""
@@ -78,12 +232,14 @@ class SchemeCard(SimpleCardWidget):
         self.uninstall_button.setText(
             i18n.tr("scheme.remove" if self.scheme.is_skin else "common.uninstall")
         )
+        self.switch_button.setText(i18n.tr("scheme.enable"))
         if self.scheme.is_skin:
             self.set_default_button.setText(i18n.tr("scheme.set_default"))
             self.set_default_button.setToolTip(i18n.tr("scheme.set_default_tip"))
             self._refresh_skin_labels()
         else:
             self.install_button.setText(i18n.tr("common.install"))
+            self._refresh_scheme_labels()
 
     def __init__(self, scheme: Scheme, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -148,6 +304,13 @@ class SchemeCard(SimpleCardWidget):
             i18n.tr("scheme.switch_to" if scheme.is_skin else "common.install"),
         )
         self.install_button.clicked.connect(lambda: self.install_requested.emit(scheme.key))
+        # v1.0.38：方案切换按钮（皮肤卡的切换语义由 install_button 承担）
+        self.switch_button = PushButton(
+            FluentIcon.PLAY, i18n.tr("scheme.enable")
+        )
+        self.switch_button.setToolTip(i18n.tr("scheme.enable_tip"))
+        self.switch_button.clicked.connect(self._on_switch_clicked)
+        self.switch_button.setVisible(not scheme.is_skin)
         # v1.0.12：皮肤卡「设为默认」（安装器侧偏好，不写 rime 配置）
         self.set_default_button = PushButton(
             FluentIcon.PIN, i18n.tr("scheme.set_default")
@@ -157,6 +320,7 @@ class SchemeCard(SimpleCardWidget):
         self.set_default_button.setVisible(scheme.is_skin)
         for button in (
             self.set_default_button,
+            self.switch_button,
             self.check_update_button,
             self.uninstall_button,
             self.install_button,
@@ -175,6 +339,11 @@ class SchemeCard(SimpleCardWidget):
         self._installed = False
         self._active = False
         self._default = False
+        # v1.0.38：该卡方案包提供的 schema_id（manifest files 推导）与当前态
+        self._schema_ids: tuple[str, ...] = ()
+        # v1.0.39：schema_id → 显示名（供「启用」提示显示人可读名）
+        self._schema_names: dict[str, str] = {}
+        self._schema_active = False
         self.set_installed(False)
 
     @property
@@ -186,9 +355,70 @@ class SchemeCard(SimpleCardWidget):
         if self.scheme.is_skin:
             self._refresh_skin_labels()
         else:
-            self.installed_label.setText("✓ 已安装" if installed else "")
-            self.install_button.setText("重新安装" if installed else "安装")
+            self._refresh_scheme_labels()
         self.installed_label.setStyleSheet(f"color: {STATUS_COLORS['ok']};")
+
+    # ---- 方案切换态（v1.0.38） ----
+
+    def set_schema_ids(self, ids) -> None:
+        """注入该卡方案包提供的 schema_id（manifest files 记录推导）。
+
+        空列表 = 该包没有可识别的方案文件（或未安装）——「启用」按钮保持
+        隐藏，避免点出一个没有目标的开关。
+        """
+        self._schema_ids = tuple(ids or ())
+        if not self.scheme.is_skin:
+            self.switch_button.setVisible(bool(self._schema_ids))
+            self._refresh_scheme_labels()
+
+    def set_schema_names(self, names: dict) -> None:
+        """注入 schema_id → 显示名映射（供「启用」提示显示人可读名）。"""
+        self._schema_names = dict(names or {})
+        if not self.scheme.is_skin:
+            self._refresh_scheme_labels()
+
+    def _primary_schema_name(self) -> str:
+        """主方案的可读名（未知时回退 schema_id）。"""
+        if not self._schema_ids:
+            return ""
+        return self._schema_names.get(self._schema_ids[0], self._schema_ids[0])
+
+    def set_schema_active(self, active: bool) -> None:
+        """当前生效方案是否属于这个包（驱动「当前方案」徽标）。"""
+        self._schema_active = active
+        if not self.scheme.is_skin:
+            self._refresh_scheme_labels()
+
+    def _refresh_scheme_labels(self) -> None:
+        """非皮肤卡徽标与主按钮：当前方案 > 已安装；「启用」随安装态显隐。"""
+        if self.scheme.is_skin:
+            return
+        self.install_button.setText(
+            i18n.tr("common.reinstall" if self._installed else "common.install")
+        )
+        if self._schema_active:
+            self.installed_label.setText(i18n.tr("scheme.current_schema"))
+            self.switch_button.setVisible(False)
+        else:
+            self.installed_label.setText("✓ 已安装" if self._installed else "")
+            self.switch_button.setVisible(self._installed and bool(self._schema_ids))
+        self.installed_label.setStyleSheet(f"color: {STATUS_COLORS['ok']};")
+        if self._installed and self._schema_ids:
+            if len(self._schema_ids) > 1:
+                # v1.0.39：胶囊墙已改为下拉菜单，提示语随之改写
+                self.switch_button.setToolTip(
+                    i18n.tr(
+                        "scheme.enable_multi_tip",
+                        n=len(self._schema_ids),
+                        name=self._primary_schema_name(),
+                    )
+                )
+            else:
+                self.switch_button.setToolTip(i18n.tr("scheme.enable_tip"))
+
+    def _on_switch_clicked(self) -> None:
+        if self._schema_ids:
+            self.switch_requested.emit(self._schema_ids[0])
 
     def set_skin_state(self, active: bool, default: bool) -> None:
         """v1.0.12：刷新皮肤卡的「当前皮肤 / 我的默认」态。
@@ -223,6 +453,7 @@ class SchemeCard(SimpleCardWidget):
         """按状态机规则刷新按钮可用性与禁用提示（F7）。"""
         install_rule = sm.rule("install_scheme")
         uninstall_rule = sm.rule("uninstall_scheme")
+        switch_rule = sm.rule("switch_scheme")
 
         self.install_button.setEnabled(install_rule.enabled)
         if self.scheme.is_skin:
@@ -236,28 +467,40 @@ class SchemeCard(SimpleCardWidget):
             self.install_button.setToolTip(
                 install_rule.reason
                 or (
-                    "重新安装该方案（aria2 拉取最新内容）"
+                    i18n.tr("scheme.reinstall_tip")
                     if self._installed
-                    else "安装该方案到当前 rime 配置目录"
+                    else i18n.tr("scheme.install_tip")
                 )
             )
 
         uninstall_reason = uninstall_rule.reason
         if uninstall_rule.enabled and not self._installed:
-            uninstall_reason = "该方案尚未安装"
+            uninstall_reason = i18n.tr("scheme.not_installed")
         self.uninstall_button.setEnabled(uninstall_rule.enabled and self._installed)
         if self.scheme.is_skin:
             self.uninstall_button.setToolTip(
                 uninstall_reason or i18n.tr("scheme.remove_tip")
             )
         else:
-            self.uninstall_button.setToolTip(uninstall_reason or "卸载该方案并还原被覆盖的文件")
+            self.uninstall_button.setToolTip(uninstall_reason or i18n.tr("scheme.uninstall_tip"))
 
         check_reason = install_rule.reason
         if install_rule.enabled and not self._installed:
-            check_reason = "该方案尚未安装，无需检查更新"
+            check_reason = i18n.tr("scheme.not_installed_no_update")
         self.check_update_button.setEnabled(install_rule.enabled and self._installed)
-        self.check_update_button.setToolTip(check_reason or "下载上游内容并与本地指纹对比")
+        self.check_update_button.setToolTip(check_reason or i18n.tr("scheme.check_update_tip"))
+
+        # v1.0.38：方案切换按钮——未安装/无 schema_id/规则禁用时不可点
+        switch_reason = switch_rule.reason
+        if switch_rule.enabled and not self._installed:
+            switch_reason = i18n.tr("scheme.not_installed")
+        elif switch_rule.enabled and not self._schema_ids:
+            switch_reason = i18n.tr("scheme.no_schema_files")
+        self.switch_button.setEnabled(
+            switch_rule.enabled and self._installed and bool(self._schema_ids)
+        )
+        if not self.switch_button.toolTip() or switch_reason:
+            self.switch_button.setToolTip(switch_reason or i18n.tr("scheme.enable_tip"))
 
     def set_busy(self, busy: bool, running: bool = False) -> None:
         """busy 时全部禁用；running=True 的卡片显示「执行中」徽标。"""
@@ -265,6 +508,9 @@ class SchemeCard(SimpleCardWidget):
         self.uninstall_button.setEnabled(not busy and self._installed)
         self.check_update_button.setEnabled(not busy and self._installed)
         self.set_default_button.setEnabled(not busy)
+        self.switch_button.setEnabled(
+            not busy and self._installed and bool(self._schema_ids)
+        )
         if running:
             self.installed_label.setText("⟳ 执行中")
             self.installed_label.setStyleSheet(f"color: {STATUS_COLORS['warn']};")
@@ -276,6 +522,7 @@ class SchemePage(ProgressAreaMixin, PageBase):
     install_requested = pyqtSignal(str)  # scheme key
     uninstall_requested = pyqtSignal(str)
     check_update_requested = pyqtSignal(str)
+    switch_requested = pyqtSignal(str)  # schema_id：切换当前输入方案（v1.0.38）
     custom_install_requested = pyqtSignal(str)  # 自定义规格文本
     set_default_requested = pyqtSignal(str)  # 皮肤 key：设为我的默认
     restore_default_requested = pyqtSignal()  # 恢复我的默认皮肤
@@ -304,10 +551,43 @@ class SchemePage(ProgressAreaMixin, PageBase):
         # v1.0.12：皮肤当前态（active 由配置文件反读）与我的默认（manifest 偏好）
         self._active_skin_key = ""
         self._default_skin_key = ""
+        # v1.0.38：方案切换态（由主窗口经 set_switchable_state/set_schema_ids 注入）
+        self._switchable: list = []
+        self._active_schema_id = ""
+        self._schema_ids: dict[str, tuple[str, ...]] = {}
+        # v1.0.39：包归属（key → schema_id 列表 / key → 显示名），
+        # 下拉菜单按包分组时需要
+        self._package_schemas: dict[str, list[str]] = {}
+        self._package_names: dict[str, str] = {}
 
         self.status_row = self.add_row("安装状态", "")
         self.frontend_row = self.add_row("目标前端", "")
         self.rime_dir_row = self.add_row("配置目录", "")
+
+        # v1.0.40：「当前方案」是**可操作控件**，不是只读状态——用分隔线把
+        # 它与上面三行纯事实隔开，标签紧贴下拉（不隔空右对齐），右侧补一句
+        # 操作提示。v1.0.39 曾把它做成「文字 + 32px 透明箭头」，真机反馈
+        # 「隐藏太深，不点就不知道能点」。
+        self._switcher_divider = QWidget(self.card)
+        self._switcher_divider.setFixedHeight(1)
+        # 中性灰：浅色/深色主题下都可见，无需跟随主题重刷
+        self._switcher_divider.setStyleSheet(
+            "background-color: rgba(128, 128, 128, 0.28);"
+        )
+        self.card_layout.addWidget(self._switcher_divider)
+
+        self.current_schema_row = QHBoxLayout()
+        self.current_schema_row.setSpacing(10)
+        self._switcher_title = BodyLabel(i18n.tr("row.current_schema"))
+        self.current_schema_row.addWidget(self._switcher_title)
+        self.schema_switcher = SchemaSwitcher(self)
+        self.schema_switcher.switch_requested.connect(self.switch_requested.emit)
+        self.current_schema_row.addWidget(self.schema_switcher)
+        self._switcher_hint = CaptionLabel(i18n.tr("scheme.switcher_hint"))
+        self._switcher_hint.setStyleSheet("color: rgba(128, 128, 128, 0.9);")
+        self.current_schema_row.addWidget(self._switcher_hint)
+        self.current_schema_row.addStretch(1)
+        self.card_layout.addLayout(self.current_schema_row)
 
         # 筛选 + 搜索
         filter_row = QHBoxLayout()
@@ -461,6 +741,8 @@ class SchemePage(ProgressAreaMixin, PageBase):
         card.uninstall_requested.connect(self.uninstall_requested.emit)
         card.check_update_requested.connect(self.check_update_requested.emit)
         card.set_default_requested.connect(self.set_default_requested)
+        card.switch_requested.connect(self.switch_requested.emit)
+        card.set_schema_ids(self._schema_ids.get(scheme.key, ()))
         self._cards.append(card)
         # v1.0.9：皮肤归入独立分区（与输入法方案分开展示）
         (self.skins_layout if scheme.is_skin else self.cards_layout).addWidget(card)
@@ -543,6 +825,72 @@ class SchemePage(ProgressAreaMixin, PageBase):
             card.set_installed(card.scheme.key in self._installed_keys)
         self._rebuild_skin_chips()
         self._apply_filter()
+
+    # ---- 方案切换态（v1.0.38） ----
+
+    def set_switchable_state(self, items, active_id: str) -> None:
+        """刷新切换器与卡片当前徽标。
+
+        items：``core.schema_switch.SwitchableSchema`` 列表（扫盘得到）；
+        active_id：``detect_active_schema`` 反读的当前方案（用户在现场用
+        Ctrl+` 切换后 rime 自己写 user.yaml，反读依然准确）。
+        """
+        self._switchable = list(items or [])
+        self._active_schema_id = active_id or ""
+        # v1.0.39：schema 显示名注入卡片（「启用」提示用可读名而非 id）
+        names = {s.id: s.name for s in self._switchable}
+        for card in self._cards:
+            card.set_schema_names(names)
+        self._refresh_switch_ui()
+
+    def set_schema_ids(self, mapping: dict) -> None:
+        """注入 scheme key → schema_id 列表（主窗口从 manifest files 推导）。"""
+        self._schema_ids = {k: tuple(v) for k, v in (mapping or {}).items()}
+        for card in self._cards:
+            card.set_schema_ids(self._schema_ids.get(card.scheme.key, ()))
+            # 可用态由 apply_rules 决定（含「未安装」原因），注入后必须重算——
+            # 否则 bind 时（schema_ids 还空）算出的禁用态会一直留着
+            card.apply_rules(self._sm)
+        # v1.0.39：包归属随映射一同更新（分组菜单需要）
+        self._package_schemas = {k: list(v) for k, v in (mapping or {}).items()}
+        self._package_names = {
+            key: (SCHEME_MAP[key].name if key in SCHEME_MAP else key)
+            for key in self._package_schemas
+        }
+        self._refresh_switch_ui()
+
+    def _refresh_switch_ui(self) -> None:
+        """刷新切换器（当前方案显示 + 下拉菜单）与卡片当前徽标。
+
+        v1.0.39：菜单按 **方案包** 分组（组标题=包名，组内=变体），
+        恢复「我装了哪些方案」的心智；无包归属的方案归入手动/共享组。
+        """
+        groups = group_by_package(
+            self._switchable,
+            package_schemas=self._package_schemas,
+            package_names=self._package_names,
+            group_titles={
+                "manual": i18n.tr("scheme.group.manual"),
+                "shared": i18n.tr("scheme.group.shared"),
+                "other": i18n.tr("scheme.group.other"),
+            },
+        )
+        self.schema_switcher.set_state(groups, self._active_schema_id)
+
+        active_ids = {self._active_schema_id} - {""}
+        for card in self._cards:
+            if not card.scheme.is_skin:
+                card.set_schema_active(
+                    bool(active_ids & set(self._schema_ids.get(card.scheme.key, ())))
+                )
+
+    @staticmethod
+    def _set_row_title(row, text: str) -> None:
+        """刷新行标题（切语言用；结构见 PageBase.add_row：标题是首个控件）。"""
+        item = row.itemAt(0)
+        label = item.widget()
+        if label is not None:
+            label.setText(text)
 
     # ---- 皮肤当前态 / 我的默认 / 已安装快捷切换（v1.0.12） ----
 
@@ -631,8 +979,9 @@ class SchemePage(ProgressAreaMixin, PageBase):
     def set_busy(self, busy: bool, title: str = "", running_key: str = "") -> None:
         """进入/退出执行态。
 
-        页面级不变量：busy 时全部方案卡按钮、自定义安装、缓存选项均禁用，
-        仅取消可用；退出时按状态机规则恢复。running_key 卡片显示「执行中」。
+        页面级不变量：busy 时全部方案卡按钮、自定义安装、缓存选项、已安装
+        方案快捷条均禁用，仅取消可用；退出时按状态机规则恢复。running_key
+        卡片显示「执行中」。
         """
         self._running_key = running_key if busy else ""
         for card in self._cards:
@@ -641,6 +990,8 @@ class SchemePage(ProgressAreaMixin, PageBase):
         self.custom_input.setEnabled(not busy)
         self.log_button.setEnabled(not busy)
         self.cancel_button.setEnabled(busy)
+        # v1.0.39：切换器下拉在执行期禁用（避免并发发两次切换）
+        self.schema_switcher.set_busy(busy)
         # v1.0.12：busy 时禁用「恢复我的默认」（退出 busy 后按偏好恢复可用性）
         self.restore_default_button.setEnabled(
             not busy and bool(self._default_skin_key)
@@ -654,6 +1005,8 @@ class SchemePage(ProgressAreaMixin, PageBase):
             self._dots_timer.stop()
             self.reset_progress()
             self._fill(self._report, self._sm)
+            # 退出执行态后按状态机恢复快捷条可用性（引擎未装时置灰）
+            self._refresh_switch_ui()
 
     def set_step(self, index: int, total: int, title: str) -> None:
         self._status_base = f"（{index}/{total}）{title}" if total > 1 else title
@@ -680,7 +1033,18 @@ class SchemePage(ProgressAreaMixin, PageBase):
         self.restore_default_button.setText(i18n.tr("scheme.restore_default"))
         self.restore_default_button.setToolTip(i18n.tr("scheme.restore_default_tip"))
         self._skin_chips_label.setText(i18n.tr("scheme.installed_skins"))
+        # v1.0.39：切换器相关文案（行标题此前硬编码中文，英文界面会漏中文）
+        self._switcher_title.setText(i18n.tr("row.current_schema"))
+        self._switcher_hint.setText(i18n.tr("scheme.switcher_hint"))
+        self.schema_switcher.retranslate()
+        for row, key in (
+            (self.status_row, "row.install_status"),
+            (self.frontend_row, "row.frontend"),
+            (self.rime_dir_row, "row.rime_dir"),
+        ):
+            self._set_row_title(row, i18n.tr(key))
         self._refresh_skin_header()
+        self._refresh_switch_ui()
         for card in getattr(self, "_cards", []):
             card.retranslate()
         current = self.filter_box.currentIndex()

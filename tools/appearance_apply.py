@@ -10,6 +10,8 @@
     python3 appearance_apply.py --ibus-conf <rime_user_dir> --revert-ibus-style
     python3 appearance_apply.py --themes-dir <path> --delete-theme <key> \
         [--fcitx5-conf <p> --backup <p> --reset-theme-to-default]
+    python3 appearance_apply.py --rime-conf <rime_user_dir> --page-size <1..9>
+    python3 appearance_apply.py --rime-conf <rime_user_dir> --revert-page-size
 
 - `--theme`：内置主题（rime-installer-*）先写入 themes-dir，再改写
   classicui.conf 的 Theme/DarkTheme（首次改写前备份原件）；
@@ -19,7 +21,10 @@
   原件主题**（不可用则退回编译内置的 default）再删目录——顺序不可颠倒，
   反过来一旦写配置失败，conf 就指向了已删掉的目录；
 - `--ibus-style`：把 style/horizontal、inline_preedit、color_scheme
-  写进 <rime_dir>/ibus_rime.custom.yaml 的本安装器标记块。
+  写进 <rime_dir>/ibus_rime.custom.yaml 的本安装器标记块；
+- `--page-size`（v1.0.41）：把候选词数量（menu/page_size）写进
+  <rime_dir>/default.custom.yaml 的标记块，并给「自己在方案文件里写死
+  page_size」的方案补写 <id>.custom.yaml；`--revert-page-size` 移除这些块。
 
 退出码：0 成功；2 参数或目录错误；3 未知主题；4 写入失败。
 被主窗口的 TaskRunner 以子进程方式调用（stdout 供日志与进度解析）。
@@ -32,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core import appearance  # noqa: E402
+from core import appearance, candidate_count  # noqa: E402
 
 _EXIT_OK, _EXIT_ARGS, _EXIT_UNKNOWN, _EXIT_WRITE = 0, 2, 3, 4
 
@@ -68,6 +73,29 @@ def main(argv: list[str]) -> int:
         else:
             print(f"无法识别的参数: {item}")
             return _EXIT_ARGS
+
+    # v1.0.41：候选词数量（menu/page_size）——全局 patch + 方案级补丁
+    if "page-size" in opts or "revert-page-size" in flags:
+        rime_dir = opts.get("rime-conf")
+        if not rime_dir or not Path(rime_dir).is_dir():
+            print(f"配置目录不存在: {rime_dir}")
+            return _EXIT_ARGS
+        try:
+            if "page-size" in opts:
+                print(
+                    candidate_count.write_page_size(
+                        Path(rime_dir), opts["page-size"]
+                    )
+                )
+            else:
+                print(candidate_count.remove_page_size(Path(rime_dir)))
+        except ValueError as exc:
+            print(f"参数错误: {exc}")
+            return _EXIT_ARGS
+        except OSError as exc:
+            print(f"写入失败: {exc}")
+            return _EXIT_WRITE
+        return _EXIT_OK
 
     if "revert-theme" in flags:
         conf = opts.get("fcitx5-conf")
@@ -169,7 +197,8 @@ def main(argv: list[str]) -> int:
         "用法: appearance_apply.py --fcitx5-conf <p> --themes-dir <p> --backup <p> "
         "--theme <key> | --revert-theme | --themes-dir <p> --delete-theme <key> "
         "[--reset-theme-to-default] | --ibus-conf <dir> "
-        "--ibus-style <spec> | --revert-ibus-style"
+        "--ibus-style <spec> | --revert-ibus-style | --rime-conf <dir> "
+        "--page-size <1..9> | --revert-page-size"
     )
     return _EXIT_ARGS
 

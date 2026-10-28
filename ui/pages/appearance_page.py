@@ -1,8 +1,10 @@
 """外观页（v1.0.13，v1.0.19 重做主题展示）：Linux 上真实可见的候选窗外观控制。
 
 rime 配色在 Linux 不被前端渲染（源码级核查结论，见 core/appearance.py
-模块 docstring），本页提供两条真实可见的路径：
+模块 docstring），本页提供三条真实可见的路径：
 
+- **候选词数量（v1.0.41）**：rime 引擎的 ``menu/page_size``——每页几个候选，
+  由引擎决定、fcitx5 / ibus 通用，改完重新部署即生效；
 - fcitx5 用户：classicui 主题切换（v1.0.19 起分「内置主题 / 我的主题」
   两个标签页的卡片网格，卡片里直接画出该主题的候选窗）+ 打开主题目录；
 - ibus 用户：ibus_rime.custom.yaml 全局外观项（横排候选 / 内嵌预编辑 /
@@ -25,7 +27,14 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
-from PyQt6.QtWidgets import QGridLayout, QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QButtonGroup,
+    QGridLayout,
+    QHBoxLayout,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from qfluentwidgets import (
     BodyLabel,
@@ -35,6 +44,7 @@ from qfluentwidgets import (
     IconWidget,
     LineEdit,
     MessageBox,
+    PillPushButton,
     PrimaryPushButton,
     PushButton,
     ScrollArea,
@@ -48,7 +58,7 @@ from qfluentwidgets import (
     themeColor,
 )
 
-from core import appearance, i18n
+from core import appearance, candidate_count, i18n, schema_switch
 from core.detector import EnvReport
 from core.schemes import parse_spec
 from core.state_machine import StateMachine
@@ -59,6 +69,20 @@ from ui.theme_swatch import CandidatePreview, current_tag_style, tag_style
 _CARD_HEIGHT = 196
 #: 每列最小宽度（含间距）——决定网格列数
 _COLUMN_WIDTH = 340
+
+#: 选中档位的含义（v1.0.42：下拉换刻度后，解释放在控件下方一行动态文案里）
+_PAGE_SIZE_LEVELS = {
+    5: "appearance.page_size_level_default",
+    7: "appearance.page_size_level_recommend",
+    9: "appearance.page_size_level_max",
+}
+
+#: 刻度上带悬停解释的档位（5 默认 / 7 推荐 / 9 上限，9 顺便交代 0 键的取舍）
+_PAGE_SIZE_TIPS = {
+    5: "appearance.page_size_tip_default",
+    7: "appearance.page_size_tip_recommend",
+    9: "appearance.page_size_tip_max",
+}
 
 
 class _ElidedLabel(BodyLabel):
@@ -349,6 +373,8 @@ class AppearancePage(ProgressAreaMixin, PageBase):
     link_requested = pyqtSignal(str)  # 外部链接（鸣谢区）
     ibus_style_requested = pyqtSignal(bool, bool, str)  # horizontal, inline_preedit, color_scheme
     ibus_revert_requested = pyqtSignal()
+    page_size_requested = pyqtSignal(int)  # v1.0.41：每页候选词数量（menu/page_size）
+    page_size_revert_requested = pyqtSignal()
     cancel_requested = pyqtSignal()
     log_requested = pyqtSignal()
 
@@ -362,11 +388,15 @@ class AppearancePage(ProgressAreaMixin, PageBase):
         self._current_theme = ""
         self._backup_exists = False
         self._ibus_style: appearance.IbusStyle | None = None
+        #: v1.0.41：当前生效的候选词数量 + 本安装器是否写过该配置
+        self._page_size = candidate_count.PAGE_SIZE_DEFAULT
+        self._page_size_block = False
         self._busy = False
 
         self.frontend_row = self.add_row(i18n.tr("appearance.frontend_row"), "")
         self.theme_row = self.add_row(i18n.tr("appearance.theme_row"), "")
         self.ibus_row = self.add_row(i18n.tr("appearance.ibus_row"), "")
+        self.page_size_row = self.add_row(i18n.tr("appearance.page_size_row"), "")
 
         # 执行进度区（与方案页同款：等待态条纹 + 数值平滑动画）
         self._init_progress_area(self.card_layout)
@@ -535,6 +565,86 @@ class AppearancePage(ProgressAreaMixin, PageBase):
         self.ibus_note.setWordWrap(True)
         ibus_layout.addWidget(self.ibus_note)
 
+        # ---- v1.0.41：候选词数量（引擎侧，fcitx5 / ibus 通用） ----
+        # 与下面的主题分区是两件事：主题决定「长什么样」，这里决定「一页几个」。
+        # 值域 1–9（10 个要靠 0 键选字，各方案的前端行为不一致，故不开放）。
+        #
+        # v1.0.42 重做：下拉换成 1–9 刻度（值域一眼可见，省掉「最多能设几」的
+        # 疑问，也少一次展开）；「恢复默认」移到标题行右侧（次要操作不跟控件抢
+        # 位置）；说明与刻度同一行，卡片高度由内容决定——不再用一块大预览把
+        # 卡片撑高、再在左下方留一片空白。
+        self.engine_label = StrongBodyLabel(i18n.tr("appearance.section_candidates"))
+        self.page_size_card = SimpleCardWidget()
+        size_layout = QVBoxLayout(self.page_size_card)
+        size_layout.setContentsMargins(18, 14, 18, 14)
+        size_layout.setSpacing(8)
+
+        # 控件行：标题 + 1–9 刻度 + 恢复默认，全部挤在一行（30px），
+        # 说明文案另起一行——卡片高度只剩「一行控件 + 两行说明」。
+        size_head = QHBoxLayout()
+        size_head.setSpacing(16)
+        self.page_size_label = BodyLabel(i18n.tr("appearance.page_size_title"))
+        size_head.addWidget(self.page_size_label)
+
+        # 1–9 刻度：每格一个胶囊按钮，选中态是实心强调色（PillPushButton 自带）
+        self.page_size_buttons: dict[int, PillPushButton] = {}
+        #: 每格的基础提示（禁用时临时覆盖成原因，恢复时按此还原）
+        self._page_size_tips: dict[int, str] = {}
+        self.page_size_group = QButtonGroup(self.page_size_card)
+        self.page_size_group.setExclusive(True)
+        # idClicked 只在用户点击时发出——程序化 setChecked 不会误触发部署
+        self.page_size_group.idClicked.connect(self._on_page_size_clicked)
+        selector = QWidget(self.page_size_card)
+        selector_row = QHBoxLayout(selector)
+        selector_row.setContentsMargins(0, 0, 0, 0)
+        selector_row.setSpacing(8)
+        for value in range(candidate_count.PAGE_SIZE_MIN, candidate_count.PAGE_SIZE_MAX + 1):
+            button = PillPushButton(str(value), selector)
+            button.setFixedHeight(30)
+            button.setMinimumWidth(30)
+            button.setMaximumWidth(40)
+            button.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            tip_key = _PAGE_SIZE_TIPS.get(value)
+            tip_text = i18n.tr(tip_key) if tip_key else ""
+            self._page_size_tips[value] = tip_text
+            button.setToolTip(tip_text)
+            self.page_size_group.addButton(button, value)
+            self.page_size_buttons[value] = button
+            selector_row.addWidget(button)
+        selector_row.addStretch(1)
+
+        size_head.addWidget(selector)
+        size_head.addStretch(1)
+        self.page_size_revert_button = PushButton(
+            FluentIcon.SYNC, i18n.tr("appearance.page_size_revert")
+        )
+        self.page_size_revert_button.clicked.connect(self.page_size_revert_requested.emit)
+        size_head.addWidget(self.page_size_revert_button)
+        size_layout.addLayout(size_head)
+
+        # 当前档位的含义（跟随点击变化）：回答「我该选几」
+        self.page_size_hint = CaptionLabel(
+            i18n.tr(
+                _PAGE_SIZE_LEVELS.get(
+                    candidate_count.PAGE_SIZE_DEFAULT, "appearance.page_size_level_other"
+                ),
+                n=candidate_count.PAGE_SIZE_DEFAULT,
+            )
+        )
+        self.page_size_hint.setWordWrap(True)
+        size_layout.addWidget(self.page_size_hint)
+
+        self.page_size_scoped = CaptionLabel("")
+        self.page_size_scoped.setWordWrap(True)
+        self.page_size_scoped.hide()
+        size_layout.addWidget(self.page_size_scoped)
+
+        self.page_size_note = CaptionLabel(i18n.tr("appearance.page_size_note"))
+        self.page_size_note.setWordWrap(True)
+        size_layout.addWidget(self.page_size_note)
+
+        sections.addWidget(self.engine_label)
+        sections.addWidget(self.page_size_card)
         sections.addWidget(self.fcitx5_label)
         sections.addWidget(self.themes_card)
         sections.addWidget(self.fcitx5_note)
@@ -607,6 +717,17 @@ class AppearancePage(ProgressAreaMixin, PageBase):
             self.inline_switch.isChecked(),
             color,
         )
+
+    # ---- 候选词数量（v1.0.41） ----
+
+    def _on_page_size_clicked(self, value: int) -> None:
+        """用户在刻度上点了某一格（idClicked 只响应用户操作）。"""
+        value = candidate_count.clamp(value)
+        # 点的是当前值、且配置已由本安装器持有 → 不发意图，
+        # 避免一次无意义的重新部署 + 框架重启（v1.0.40 同一教训）
+        if value == self._page_size and self._page_size_block:
+            return
+        self.page_size_requested.emit(value)
 
     def _on_tab_changed(self, route_key: str) -> None:
         self.builtin_host.setVisible(route_key == "builtin")
@@ -681,7 +802,57 @@ class AppearancePage(ProgressAreaMixin, PageBase):
             self.ibus_note.setText(
                 i18n.tr("appearance.ibus_no_dir") + "；" + i18n.tr("appearance.ibus_note")
             )
+        self._fill_page_size()
         self._apply_rules()
+
+    def _fill_page_size(self) -> None:
+        """反读「引擎实际会用」的候选数并回填控件（v1.0.41）。
+
+        取值优先级见 ``core/candidate_count.detect``：用户 patch → 当前方案
+        自身 → 方案包 default.yaml → 5。界面显示的数字必须就是用户输入时
+        看到的那一页，而不是本程序的记账。
+        """
+        rime_dir = self._report.rime_user_dir
+        schema_id = ""
+        if rime_dir is not None:
+            try:
+                schema_id = schema_switch.detect_active_schema(rime_dir)
+            except OSError:
+                schema_id = ""
+        self._page_size = candidate_count.detect(rime_dir, schema_id)
+        self._page_size_block = candidate_count.has_own_block(rime_dir)
+        scoped = (
+            candidate_count.schemas_with_own_page_size(rime_dir) if rime_dir else []
+        )
+
+        # 回填刻度：只设选中态，不发意图（idClicked 才代表用户操作）
+        for value, button in self.page_size_buttons.items():
+            button.setChecked(value == self._page_size)
+        self.page_size_hint.setText(self._page_size_level_text(self._page_size))
+
+        if rime_dir is None:
+            # 没有配置目录时不知道真实值，宁可显示占位也不要编一个 5 出来
+            self._set_row(self.page_size_row, "—", "muted")
+        else:
+            self._set_row(
+                self.page_size_row,
+                i18n.tr("appearance.page_size_value", n=self._page_size),
+                "ok",
+            )
+        if scoped:
+            # 少数方案（如 oh-my-rime）把 page_size 写在自己的方案文件里，全局
+            # patch 对它们无效——写入时会补写方案级 patch，这里提前说清楚
+            self.page_size_scoped.setText(
+                i18n.tr("appearance.page_size_scoped", count=len(scoped))
+            )
+            self.page_size_scoped.show()
+        else:
+            self.page_size_scoped.hide()
+
+    def _page_size_level_text(self, value: int) -> str:
+        """当前档位的一句话解释（5 默认 / 7 推荐 / 9 上限 / 其余为自定义）。"""
+        key = _PAGE_SIZE_LEVELS.get(value, "appearance.page_size_level_other")
+        return i18n.tr(key, n=value)
 
     def _fill_ibus_controls(self) -> None:
         style = self._ibus_style or appearance.IbusStyle()
@@ -870,6 +1041,22 @@ class AppearancePage(ProgressAreaMixin, PageBase):
         self.ibus_revert_button.setToolTip(
             ibus_rule.reason or i18n.tr("appearance.ibus_revert_tip")
         )
+        # v1.0.41：候选词数量（写 rime 用户目录 + 重新部署，需先识别到目录）
+        size_rule = self._sm.rule("appearance_page_size")
+        self._set_page_size_enabled(size_rule.enabled and not self._busy)
+        for value, button in self.page_size_buttons.items():
+            button.setToolTip(size_rule.reason or self._page_size_tips.get(value, ""))
+        self.page_size_revert_button.setEnabled(
+            size_rule.enabled and self._page_size_block and not self._busy
+        )
+        self.page_size_revert_button.setToolTip(
+            size_rule.reason or i18n.tr("appearance.page_size_revert_tip")
+        )
+
+    def _set_page_size_enabled(self, enabled: bool) -> None:
+        """刻度整体启用/禁用（1–9 是一组，禁用原因看任一格的 tooltip）。"""
+        for button in self.page_size_buttons.values():
+            button.setEnabled(enabled)
 
     def bind(self, report: EnvReport, sm: StateMachine) -> None:
         self._report = report
@@ -894,6 +1081,8 @@ class AppearancePage(ProgressAreaMixin, PageBase):
             self.import_button.setEnabled(False)
             self.ibus_apply_button.setEnabled(False)
             self.ibus_revert_button.setEnabled(False)
+            self._set_page_size_enabled(False)
+            self.page_size_revert_button.setEnabled(False)
             self._show_progress_area(True)
             self.enter_waiting()
             self.set_step(1, 1, title or "准备中")
@@ -915,6 +1104,20 @@ class AppearancePage(ProgressAreaMixin, PageBase):
         self.frontend_row.itemAt(0).widget().setText(i18n.tr("appearance.frontend_row"))
         self.theme_row.itemAt(0).widget().setText(i18n.tr("appearance.theme_row"))
         self.ibus_row.itemAt(0).widget().setText(i18n.tr("appearance.ibus_row"))
+        self.page_size_row.itemAt(0).widget().setText(i18n.tr("appearance.page_size_row"))
+        self.engine_label.setText(i18n.tr("appearance.section_candidates"))
+        self.page_size_label.setText(i18n.tr("appearance.page_size_title"))
+        self.page_size_hint.setText(self._page_size_level_text(self._page_size))
+        self.page_size_note.setText(i18n.tr("appearance.page_size_note"))
+        for value, button in self.page_size_buttons.items():
+            tip_key = _PAGE_SIZE_TIPS.get(value)
+            tip_text = i18n.tr(tip_key) if tip_key else ""
+            self._page_size_tips[value] = tip_text
+            button.setToolTip(tip_text)
+        self.page_size_revert_button.setText(i18n.tr("appearance.page_size_revert"))
+        self.page_size_revert_button.setToolTip(
+            i18n.tr("appearance.page_size_revert_tip")
+        )
         self.fcitx5_label.setText(i18n.tr("appearance.section_fcitx5"))
         self.ibus_label.setText(i18n.tr("appearance.section_ibus"))
         self.fcitx5_note.setText(i18n.tr("appearance.theme_note"))

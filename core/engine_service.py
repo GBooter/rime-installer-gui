@@ -74,6 +74,11 @@ def _elevated(argv: list[str]) -> list[str]:
     return prefixed
 
 
+def elevated_command(argv: list[str]) -> list[str]:
+    """提权包装的公开入口（v1.0.37：残留清理的 chown 步复用同一套 polkit 逻辑）。"""
+    return _elevated(argv)
+
+
 def _single_step(
     title: str,
     script: str,
@@ -163,6 +168,34 @@ def build_install_steps(frontend: str, update_first: bool = True) -> list[Step]:
         title, script, weight=4, hint_key="msg.engine_install_failed"
     )
 
+
+
+def build_deployer_install_step() -> Step:
+    """v1.0.37：缺 rime_deployer 时的修复步——best-effort 安装 librime-bin。
+
+    各发行版的 ibus-rime / fcitx5-rime **都不依赖** librime-bin（包依赖与
+    文件清单已核），手动按论坛教程装过引擎的机器基本都没有它——「重新部署」
+    只能靠引擎惰性部署，成功率低（UOS 25 真机反馈的根因之一）。
+
+    整步包在 `{ ... || echo 提示; }` 里：apt update 失败（失效第三方源）、
+    源里没有该包、用户取消密码框，都只警告不判失败——部署脚本随后会走
+    「重启框架 + 强制全量重建」兜底，仍有成功的可能。
+    """
+    apt = apt_program()
+    pkg = config.ENGINE_DEPLOYER_PACKAGE
+    update = apt_command(apt, "update")
+    install = apt_command(apt, "install", "-y", pkg)
+    script = (
+        "{ " + update + " || echo '===== 提示：apt 索引更新失败"
+        "（失效第三方源最常见），继续尝试安装 ====='; }"
+        " && { " + install + f" || echo '===== 提示：{pkg} 未能安装"
+        "（软件源里可能没有该包，或源需要激活），将改用重启框架的方式部署 ====='; }"
+    )
+    return Step(
+        f"安装部署工具 {pkg}（提供 rime_deployer）",
+        shell_wrap(_elevated(["bash", "-c", script])),
+        weight=1,
+    )
 
 
 def build_uninstall_steps(frontend: str) -> list[Step]:

@@ -2,8 +2,8 @@
 
 一款面向 **Ubuntu / Linux Mint / Deepin** 的 RIME（中州韵）图形化安装与管理工具。把「装引擎、装方案、配环境、换皮肤、备份恢复、干净卸载」这条原本全靠命令行的链路，收进一个 PyQt6 + Fluent 风格的单窗口程序里。
 
-![version](https://img.shields.io/badge/version-1.0.36-blue)
-![platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B%20%7C%20Mint%2022%2B%20%7C%20Deepin%2025.2%2B-2ea44f)
+![version](https://img.shields.io/badge/version-1.0.42-blue)
+![platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B%20%7C%20Mint%2022%2B%20%7C%20Deepin%2025.2%2B%20%28%E5%90%AB%20UOS%2025%29-2ea44f)
 ![display](https://img.shields.io/badge/display-X11%20%2F%20Wayland-9cf)
 ![license](https://img.shields.io/badge/license-GPL--3.0-orange)
 
@@ -27,11 +27,11 @@
 | 页面 | 能力 |
 | --- | --- |
 | **欢迎** | 首次引导，展示检测到的框架与环境概况 |
-| **引擎安装** | 安装 / 卸载 `ibus-rime`、`fcitx5-rime`；可选先 `apt update`、可连配置与词库一起清理 |
-| **方案市场** | 官方 preset / extra + 雾凇拼音、白霜等热门方案；支持自定义 `user/repo`；体积/来源/适用人群一目了然；装完可检查更新 |
-| **外观** | fcitx5 候选窗主题切换（内置 + 一键导入仓库）、ibus 全局外观设置、真实候选窗预览、主题删除与目录直达 |
+| **引擎安装** | 安装 / 卸载 `ibus-rime`、`fcitx5-rime`；可选先 `apt update`、可连配置与词库一起清理；自动扫描手动安装残留（root 属主文件、失效方案引用）并可一键清理 |
+| **方案市场** | 官方 preset / extra + 雾凇拼音、白霜等热门方案；支持自定义 `user/repo`；体积/来源/适用人群一目了然；装完可检查更新；**多方案一键切换**（状态卡内的「当前方案」下拉框直接显示正在使用的方案，列表按方案包分组，当前方案反读 `user.yaml`，不在列表会自动加入并重启框架，约 1 秒生效；卡片「启用」直接切到该包主方案） |
+| **外观** | 每页候选词数量（1–9 刻度，点一下即改、自动重新部署）、fcitx5 候选窗主题切换（内置 + 一键导入仓库）、ibus 全局外观设置、真实候选窗预览、主题删除与目录直达 |
 | **备份恢复** | 打包 rime 用户目录为 zip；恢复可选「先备份当前状态」或「清空后恢复」；支持导入导出、删除 |
-| **环境修复** | 八项体检：环境变量、框架进程、引擎包、方案清单、部署状态、输入源注册、默认框架、配置目录；可修项一键修复 |
+| **环境修复** | 十一项体检：环境变量、框架进程、引擎包、方案清单、部署状态、输入源注册、默认框架、配置目录、安装残留、apt 源代号、apt 源可用性；可修项一键修复 |
 | **日志** | 所有外部命令（apt / aria2 / plum）的原始输出，实时可查 |
 | **设置** | 界面语言（中/英）、外观深浅色、apt 软件源测速与切换、关于信息 |
 
@@ -54,6 +54,8 @@
 ![导入主题](docs/screenshots/04-appearance-import.png)
 
 > 说明：Linux 下 rime 自身的 `style` / `color_scheme` 不被 fcitx5-rime 读取，候选窗外观实际由 fcitx5 classicui 主题绘制，所以这里切换的是 fcitx5 主题层；ibus 用户则只调整少量全局外观项。切换后会重启输入法框架使其生效。
+
+候选窗一页显示几个候选，由 rime 引擎的 `menu/page_size` 决定（雾凇、白霜默认 5 个）。外观页顶部的「每页候选词数量」是一条 1–9 刻度，点哪格就是几个（5 默认、7 推荐、9 上限），选完立即重新部署，约 1 秒生效；少数方案把该值写死在自己的方案文件里，程序会顺带写一份方案级配置，避免「设成 9 了却还是 5 个」。
 
 ### 备份与恢复
 

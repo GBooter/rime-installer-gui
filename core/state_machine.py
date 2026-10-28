@@ -79,6 +79,14 @@ class StateMachine:
                 return ActionRule(action, False, "请先安装中州韵输入法引擎")
             return ActionRule(action, True)
 
+        if action == "switch_scheme":
+            # v1.0.38：切换当前输入方案。链路（入列 + 写 user.yaml + 部署重启）
+            # 本身不需要引擎已装也能写文件，但没有引擎时重启框架没有意义、
+            # 用户也装不了方案——统一要求先装引擎，与 install_scheme 一致。
+            if not self.report.engine_installed:
+                return ActionRule(action, False, "请先安装中州韵输入法引擎")
+            return ActionRule(action, True)
+
         if action == "uninstall_scheme":
             if not self.report.engine_installed:
                 return ActionRule(action, False, "请先安装中州韵输入法引擎")
@@ -138,6 +146,13 @@ class StateMachine:
 
         if action == "appearance_ibus":
             # v1.0.13：ibus 外观项写入 rime 用户目录，需先识别配置目录
+            if self.report.rime_user_dir is None:
+                return ActionRule(action, False, "未能识别配置目录，请到设置页指定输入法前端")
+            return ActionRule(action, True)
+
+        if action == "appearance_page_size":
+            # v1.0.41：候选词数量写进 rime 用户目录的 default.custom.yaml 后重新
+            # 部署——与 ibus 外观同款前置：先识别到配置目录，否则没有落点
             if self.report.rime_user_dir is None:
                 return ActionRule(action, False, "未能识别配置目录，请到设置页指定输入法前端")
             return ActionRule(action, True)

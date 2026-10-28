@@ -39,7 +39,8 @@ mkdir -p "$BUILD/DEBIAN" "$BUILD/usr/lib/rime-installer" \
 # .smoke-tmp 为冒烟测试临时目录（CLI 子进程用例不自清，2026-10-15 实测有残留）；
 # tools/ 下只有被应用以子进程调用的三个脚本入包（appearance_apply / skin_apply /
 # snapshot_cli），其余为开发期辅助：diag_layout（一次性诊断）、rerun_flow_checks
-# （冒烟重跑）、preview_settings_mockup / render_doctor_page（离屏出图）。
+# （冒烟重跑）、preview_settings_mockup / render_doctor_page / render_appearance_page
+# （离屏出图）。
 # design/ 为设计稿渲染产物（5MB），smoke_test.py 与 .gitignore、REQUIREMENTS.md 均为
 # 开发期文件，运行时无任何引用，一律不入包。
 # packaging/ 只排除构建脚本与 desktop 源文件：icons/ 是运行时资源（config.APP_LOGO
@@ -59,6 +60,7 @@ tar --exclude='./build' --exclude='./.git' --exclude='./.workbuddy' \
     --exclude='./tools/rerun_flow_checks.py' \
     --exclude='./tools/preview_settings_mockup.py' \
     --exclude='./tools/render_doctor_page.py' \
+    --exclude='./tools/render_appearance_page.py' \
     --exclude='./packaging/build-deb.sh' --exclude='./packaging/rime-installer.desktop' \
     --exclude='./smoke_test.py' --exclude='./.gitignore' \
     --exclude='./REQUIREMENTS.md' --exclude='./design' \
@@ -72,7 +74,8 @@ cat > "$BUILD/DEBIAN/control" <<EOF
 Package: rime-installer
 Version: ${VERSION}
 Architecture: ${ARCH}
-Maintainer: RIME Installer Team <noreply@example.com>
+Maintainer: Feelup <feelup@users.noreply.github.com>
+Homepage: https://github.com/GBooter/rime-installer-gui
 Depends: python3 (>= 3.11), python3-pyqt6, python3-pyqt6.qtsvg, qt6-qpa-plugins, libgl1, libegl1, libxkbcommon0, libglib2.0-0t64 | libglib2.0-0, curl, tar, file
 Section: utils
 Priority: optional

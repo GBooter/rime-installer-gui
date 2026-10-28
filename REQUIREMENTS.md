@@ -872,3 +872,178 @@ launcher.log 里每次崩溃都是 `退出码=134`（SIGABRT）+ 同一行 stder
 - `smoke_test.py` 无断言依赖被替换的旧字符串（第 703 行「配置目录」为状态机 reason 文案，未动）。
 - 冒烟全量（`.venv/bin/python`，注意不能用 `/usr/bin/python3`——无 qfluentwidgets，theme 检查会假失败）：整轮跑过 appearance 清理阶段被 safe-delete 钩子杀（环境限制，已过项全部 OK）；剩余 12 项经 `tools/rerun_flow_checks.py` 分批补跑全过（含修复后的 window）。
 - deb 入库验证：`.venv` 0 条、图标 8 档、白名单 tools 恰 3 脚本、control 版本/架构/Depends 正确、与 v1.0.35 清单 diff 仅移除 34 条物料条目、零新增。
+
+## v1.0.37 — 手动安装残留治理 + 部署兜底加固（UOS 25 真机反馈）
+
+**用户诉求**（UOS 25 专业版真机）：手动按论坛教程装过 rime（`pkexec apt install fcitx5-rime`、`sudo cp` 方案文件、`sudo` 改共享 default.yaml）后，用本安装器点「重新部署」报「重新部署未完成」——而各项体检全是绿的（build 还在、输入法照打）。诉求：① 软件内能检测并清理这类手动安装残留，让安装前获得干净环境；② 部署本身对这类机器更稳健。
+
+**根因分析**（截图 + librime 源码 + rime_deployer 语义）：
+
+1. **属主残留**：`sudo cp` 进 `~/.local/share/fcitx5/rime` 会让目录/文件属主变 root。体检的 `_dir_readable` 只查「可读」——root 755 目录读得出来、写不进去，`rime_deployer --build` 建不了 `build.rime-new` 直接 exit 1；原 build 按 v1.0.26 设计被保留，于是「体检全绿 + 重新部署失败」。
+2. **失效方案引用**：手改 `default.custom.yaml`（或 UOS 教程的标准做法——`sudo` 改共享 `/usr/share/rime-data/default.yaml`）的 `schema_list` 加过方案，方案文件后来删了/没拷全 → `WorkspaceUpdate` 报 `missing input schema` → `failure > 0` → `rime_deployer` exit 1，整个部署失败。
+3. **缺部署工具**：各发行版的 `ibus-rime` / `fcitx5-rime` 都不依赖 `librime-bin`（v1.0.29 已核），手动装引擎的机器基本没有 `rime_deployer`——「重新部署」只能靠引擎惰性部署，而 Deepin 25/UOS 25 有「装完方案首次部署不生效」的已知缺陷（rime-ice#1439），旧脚本 8s 轮询 + 只判「build 目录存在」既等不够、又会拿旧 build 假报成功。
+
+**落地（六处）**：
+
+1. `core/residue.py`（新增）：残留检测与清理。三类可清理项——`foreign_owner`（属主非当前用户，目录自身 + 直接子项）、`stale_schema`（用户 `default.custom.yaml` 的 `schema_list` 引用了不存在的方案，行级解析不引 yaml 依赖）、`staging`（上次部署被强杀留下的 `build.rime-new`）；一类只报告项——`shared_stale`（失效引用在共享 `default.yaml`，系统文件不动，给手动指引）。清理步骤：整包 zip 备份（目录可读才做，root 700 读不了就直奔 chown）→ `chown -R $(id -u):$(id -g)`（pkexec 单步，家目录护栏）→ sed 按行删除失效引用（id 经 `re.escape` 转义——`a.b` 不得匹配 `axb`；改前留 `default.custom.yaml.rime-installer-bak`，非 `.yaml` 后缀rime 不解析）+ `rm -rf build.rime-new`。所有 IO 包 `try/except OSError`（跑在 Qt 回调里，未捕获即 abort）。
+2. `core/doctor.py`：新增「安装残留」体检项（WARN/OK/INFO 三态，明细按类型计数，**不进「一键修复」**——chown 要密码，塞静默修复流会突然弹框）；`build_fix_steps("deployed")` 在缺 `rime_deployer` 时前置 best-effort 安装 `librime-bin` 步（`{ update || echo; } && { install || echo; }`，装不上只警告，随后走部署脚本的框架兜底）。
+3. `core/deploy_guide.py`：部署脚本四处加固——① 建目录 + 实测写入探针（重定向建文件不用 touch，utimes 在只读挂载会误判），不可写直接给 `sudo chown -R "$USER"` 指引；② `rime_deployer` 编译失败/空产出不再立即 exit 1，清 staging 后走同一套框架兜底；③ 兜底时给 `default.custom.yaml` 追加「强制重新部署标记」注释（mtime 必更新，引擎重启必然全量重建——rime-ice#1439 的文档化变通方法）；④ 轮询从「目录存在」改为「build 里有比重启时新的文件」（`find -newermt`，30s 超时）——旧 build 原样存在时旧实现瞬间假报成功，现在必须等引擎真重建。
+4. `ui/pages/engine_page.py`：新增「安装残留」行 + 「清理残留」按钮（有可清理项才显示，干净机器不占按钮位）；行 tooltip 逐条列出残留详情与路径（含共享配置该改哪个文件）。
+5. `ui/main_window.py`：`residue_clean_requested` → 确认框逐条列明动作（备份/chown/yaml/staging + 共享配置只能手动的提示）→ `residue-clean` 任务（进度回引擎页）；完成 InfoBar 引导「再点一次重新部署」。
+6. i18n 中英双补：`row.residue` / `residue.*` / `engine.clean_residue*` / `msg.residue_*` / `doctor.check.residue.*`（仅 EN）；`msg.deploy_failed_hint` 补「目录不可写 → chown」分支并去掉 Ubuntu 专属措辞。
+
+**验证**：
+
+- 功能级（开发机真跑生成的脚本，三条路径全过）：deployer 编译失败 → 追加标记 → 假引擎 3s 后重建 build → 轮询 3.4s 验真成功、原 build 保留、探针已清；无 deployer 且引擎不重建 → 30s 后 exit 1 诚实失败；目录无法创建 → 预检 exit 1。deployer 成功路径（staging 替换 build）与空产出路径（保留原 build + 兜底）均过。
+- 残留清理端到端（runner 真跑 QProcess，`check_residue_clean`）：备份 zip 落临时目录、`gone`/`a.b` 两行被删而 `good`/`axb` 存活（证明 sed 转义）、`.bak` 含原始三行、`build.rime-new` 被清。
+- 冒烟：`check_residue`（检测/不误报/共享项只报告/custom list 顶替语义/sed 转义/步骤结构与护栏）、`check_doctor`（residue 入体检项清单、缺 deployer 时两步修复、部署脚本新断言含「临时切真实模式」验 touch/newermt）、`check_deploy_guide`（独立重新部署不得提权）、`check_window`（残留清理意图：取消不起任务/确认起 `residue-clean`/进度回引擎页）、`check_i18n`（键集对称）。
+- 环境注记：`cp -p` 保留时间戳依赖 utimes，在只读挂载/受限环境会把清理步带崩——备份改普通 `cp`（端到端首跑即暴露，已修）；`.rw-probe` 文件名被宿主安全钩子监控，部署探针改名 `.deploy-probe` 并用重定向建文件。
+- 版本 1.0.36 → 1.0.37（config / smoke 断言 / README 徽章与功能表同步，`SUPPORTED_SYSTEMS` 显式写上「含 UOS 25」）。
+
+## v1.0.38 — 输入方案切换（多方案一键切换 + 当前方案反读）
+
+**用户诉求**：装了好几个方案之后，提供一个在不同输入方案间切换选择、立即生效的功能；同时要能保存/显示用户已经下载的输入方案。
+
+**可行性结论（实施前已核实）**：rime 的当前方案写在用户目录 `user.yaml` 的 `var/previously_selected_schema`（原生持久化，用户现场 Ctrl+` 切换也是写这里）；可选集合 = 合并后的 `schema_list`（custom patch 整体顶替 base）；**运行中的引擎不热加载 user.yaml**，fcitx5 也没有「切换 rime 方案」的 IPC——重启框架是唯一可靠途径（与「换皮肤」同一机制，已在真机验证）。因此「立即生效」的诚实语义 = 一键完成 + 框架重启约 1 秒（输入中的预编辑可能被清空）；原生无感切换始终是输入法内的 Ctrl+` / F4 选单，本功能是它的图形化入口。
+
+**关键缺口（调查中发现）**：捆绑 plum 只拷贝文件、**从不写 schema_list**——第三方方案（雾凇等）装完后只在用户目录里，不进列表 = 选单里看不到、部署也不编译它。切换器因此自带「启用」能力：加入列表 + 设为当前 + 部署重启，四步一条链，顺手补上「装了方案却选不到」的断链。
+
+**落地（五处）**：
+
+1. `core/schema_switch.py`（新增）：`detect_active_schema()` 反读 user.yaml（未设置/指向失效方案时回落 schema_list 第一项——rime 实际行为，UI 显示的「当前」才和输入法里一致）；`list_switchable()` 扫用户/共享目录 `*.schema.yaml`（读 `schema/name` 显示名，标注 installer/manual/shared 来源）；`build_switch_steps()` 构建切换链：① 目标不在生效列表时，把「当前生效列表 + 目标」整列表写进 `default.custom.yaml` 的 patch——**必须带原列表**（patch 整体顶替，只写目标会静默弄丢预设方案，UOS 教程式共享 default.yaml 机器的典型陷阱）；② 三态写法更新 user.yaml；③ 复用部署引导（编译 + 重启框架）。两处 yaml 改写都是「构建时读原文件 → 算好新内容 → bash 备份 + heredoc 覆写」：行级插入保证用户其余配置字节级保留（sed 三形态插入在 bash 里容易写错），改前统一留 `*.rime-installer-bak`。**不依赖 rime_deployer**（`--set-active-schema` 以 CWD 为 user_dir 且依赖 librime-bin，恰恰是缺失最多的机器上没有）。
+2. `core/manifest.py`：新增 `package_files(key)`——从 files 表读方案包安装时记账的文件清单（顺序即安装顺序），切换器据此推导「方案包 → schema_id」映射。
+3. `ui/pages/scheme_page.py`：卡片「启用」按钮 + 「当前方案」徽标（仅已装且能推导出 schema_id 时显示）；页顶「当前方案」行；「已安装方案」快捷条（FlowLayout 自动换行，含手动安装与共享目录方案，当前项高亮、点击即切换）。行标题一并接入 i18n（原先硬编码中文）。
+4. `ui/main_window.py`：`switch_requested` → `_on_schema_switch`（无确认框——无破坏性且改前留 .bak，与换皮肤一致）→ `scheme-switch` 任务（进度回方案页）→ 成功 InfoBar 点名方案；`_refresh_switchable()` 在每次 dispatch 后刷新切换态（当前方案反读 user.yaml，比任何安装器侧记账都可靠）。
+5. `core/state_machine.py`：新增 `switch_scheme` 规则（要求先装引擎）。
+
+**验证**：
+
+- `smoke_test.check_schema_switch`：检测四态（显式/回落第一项/失效 id 回落/空）；列表来源标注与显示名；步骤构建（未入列三步/已在列表两步/非法 id 拒绝）；**三种形态真跑 bash**——custom 不存在（新建带 base 列表）、已有列表（只追加一行）、无列表（插入整列表且用户 style 配置字节保留）+ user.yaml 三态（新建/插入/替换不堆键）+ .bak 内容；manifest files → schema_id 映射。
+- `check_state_machine`：switch_scheme 有引擎可用/无引擎禁用并提示先装引擎。
+- `check_window`：切换意图无确认框直接构建 `scheme-switch` 任务，步骤含 schema_list 与 previously_selected_schema，进度回方案页。
+- 冒烟全量：整轮跑过 schema_switch/skin 后在 appearance 清理阶段被 safe-delete 钩子杀（已知环境限制），已过项全 OK；剩余 13 项经 `tools/rerun_flow_checks.py` 分批补跑全过（含 window、residue_clean）。
+- 版本 1.0.37 → 1.0.38（config / smoke 断言 / README 徽章与功能表同步）。
+
+## v1.0.39 — 方案切换交互重构（胶囊墙 → 按包分组的下拉菜单）
+
+**用户反馈**：截图反馈「已安装方案的切换方式感觉不太好，请重新设计」。
+
+**诊断（离屏复刻用户截图逐条核对）**：v1.0.38 的实现有三处结构性问题——
+
+1. **同一状态两处表达**：状态卡里一行「当前方案：倉頡五代·快打模式（cangjie5_express）」，正下方胶囊墙里又有一个高亮的同款胶囊，两套视觉语言表达同一件事。
+2. **粒度是文件不是方案包**：胶囊墙列的是 `*.schema.yaml` 文件——21 个胶囊里「注音 / 注音·快打模式 / 注音·慕潮正體双拼」「朙月拼音 / 简化字 / 慕潮正體 / 語句流」各自独立成项，但它们本属同几个方案包。用户心智是「我装了雾凇拼音 / 朙月拼音 / 倉頡五代」，界面却让他在 21 个碎片里挑。
+3. **位置破坏页面动线**：胶囊墙夹在状态卡与「筛选/搜索」工具栏之间，视觉上像工具栏的一部分；真正的市场卡片被挤到折叠线以下。
+
+**重新设计**（决策经用户确认：下拉菜单 + 按包分组 + 搜索 / 按包分组 / 卡片启用切主方案）：
+
+1. **单一事实源**：删掉状态行里的「当前方案」行，改为状态卡内一行「当前方案」切换器（与其它三行齐平）——左侧显示当前方案名 + schema_id + ✓，右侧下拉按钮。状态区只留安装状态/目标前端/配置目录三行纯运行时事实。
+2. **胶囊墙 → 下拉菜单**：菜单**按方案包分组**（组标题=包名，组内=该包提供的变体），顶部带搜索框可按名称/id 过滤，组标题随组内命中联动隐藏，当前项带 ✓ 标识，不在可选列表的项标「未入列表」。长列表超 12 项时菜单自身滚动。
+3. **卡片接管主路径**：卡片「启用」按钮点击即把该包**主方案**（`schema_ids[0]`）设为当前并生效；tooltip 改为显示人可读的主方案名（此前显示 schema id），并提示其余变体可在上方下拉里切换。
+4. `core/schema_switch.py` 新增 `group_by_package()`：按「方案包 → schema_id」映射（来自 manifest files 记录）把可切换方案收纳成分组，组内顺序 = manifest 记录顺序（主方案在前）；无包归属的方案（手动安装 / 系统共享）各自独立成组——它们的卸载语义与安装器装的方案不同，不应混组。分组标题可由 UI 层传入以便本地化。
+
+**技术要点（qfluentwidgets 菜单的三个坑）**：
+
+- **`Action` 没有 `setSubText`**——菜单项无法直接显示副标题。方案 id 与「是否已在可选列表」是用户判断能否切换的关键信息，故用**自定义 widget 行**承载「名称 + id + 状态标记」三层信息。
+- **`RoundMenu` 没有分组 API**：Qt 原生 `QMenu.addSection` 创建的 action 不进入 qfluentwidgets 的内部列表（`MenuActionListWidget`），分组标题渲染不出来。改用「不可选的 widget 行」作分组标题——与搜索框同一机制，绕开 delegate。
+- **`addWidget` 取 `widget.size()` 当 sizeHint**：若 widget 尚未完成 layout 排布，取到的是未确定态尺寸，每行被撑到 170px（菜单高度爆炸到 1000+）。**必须先定宽 → `adjustSize()` 触发 layout 计算**，再交给菜单。搜索框同样需要。
+
+**验证**：
+
+- `smoke_test.check_schema_switch` 新增分组断言：分组不丢条目、不重复；包组标题用显示名而非 key；同包变体收在一组且主方案在前；手装方案独立成组；无包映射时也不丢条目。
+- `smoke_test` 新增 `_check_scheme_switcher_ui`（挂在 `check_skin_ui` 后）：胶囊墙属性已移除；当前方案只在切换器表达一次（状态行不再有重复值标签）；菜单按包分组且用显示名；菜单行/标题行高度正常（未定时会撑到 170px）；搜索命中项保留、未命中隐藏、组标题随之联动；busy 时下拉禁用。
+- 冒烟全量：整轮跑过 schema_switch/skin 后在 appearance 清理阶段被 safe-delete 钩子杀（已知环境限制，与本次改动无关），已过项全 OK；剩余项经 `tools/rerun_flow_checks.py` 分批补跑全过（window / skin_ui / appearance / appearance_ui / theme_import / animation / skin_flow / appearance_flow / runner / scheme_install_flow / snapshot_service / snapshot_cli / residue_clean）。
+- 离屏渲染核对了新页面与展开菜单的实际像素效果（分组标题、✓ 标识、副标题、搜索框、菜单尺寸 286×379）。
+- 版本 1.0.38 → 1.0.39（config / smoke 断言 / README 徽章与功能表同步）。
+
+## v1.0.40 — 方案切换改为标准下拉框（修 v1.0.39 的点击失效与可发现性）
+
+**用户反馈（v1.0.39 真机）**：①点击下拉里的方案后切换没反应；②切换入口隐藏太深，不点就不知道能点——要求改成「能显示当前正在使用方案的下拉列表」。
+
+**根因（实证，非推测）**：
+
+- 查本机 `~/.local/share/rime-installer/logs/`：**没有任何用户点击产生的 `scheme-switch` 任务日志**（只有冒烟测试的痕迹），`~/.local/share/fcitx5/rime/user.yaml` 的 `previously_selected_schema` 仍是 `rime_ice` —— 写入从未发生，说明点击根本没走到 `_on_pick`。
+- 隔离测试里同一路径**能**触发（`ACTION_TRIGGERED` 正常），说明不是信号未连。真正的差异在 v1.0.39 的菜单项用的是**自定义 widget 行**（`RoundMenu.addWidget(row, onClick=...)`）——它依赖 qfluentwidgets 内部 `_onItemClicked → action.trigger()` 的间接链路，且行内是嵌套的 QLabel/QWidget 子控件；在真实输入事件下点击落不到 item 上。而页面上已有的「筛选」下拉（普通 `QAction` 项）一直正常——同一控件库，差别只在项的实现方式。
+- 可发现性：v1.0.39 是「只读文字标签 + 32px 透明箭头按钮」，箭头本身没有边框和背景，视觉上不像可点控件。
+
+**改动**：
+
+1. `ui/pages/scheme_page.py`：`SchemaSwitcher` 重写为**标准 `ComboBox`**。
+   - 控件本身显示当前方案（`✓ 方案名`）——满足「能显示当前正在使用的方案」；带边框与下拉箭头，默认就是可点外观。
+   - 选中走 `combo.activated`（**只在用户操作时发出**），点击路径与页面「筛选」下拉完全一致（普通 `QAction`），不再走自定义 widget 行的间接链路。
+   - 分组：下拉项里插入**禁用项**当方案包标题（`── 雾凇拼音 rime-ice ──`），点击无反应，把同包变体在视觉上收拢；真实项 `userData` = schema_id。
+   - 当前项加 `✓` 前缀（控件文本与列表内都能一眼看出在用一个）。
+   - 刷新时 `blockSignals(True)` 重建，**程序化设值不会误触发切换**；选中当前项不发意图（避免无意义的重部署 + 框架重启）。
+   - 删掉 v1.0.39 的 `_SchemaMenuRow` / `_SchemaGroupTitle` / `_open_menu` / `_apply_filter` 与相应 import。
+2. 布局：`当前方案` 行改为**带分隔线的独立控制区**（1px 中性灰分隔线 + 标签紧邻下拉 + 「点此切换，约 1 秒生效」提示），与上面三行只读事实（安装状态/目标前端/配置目录）分开，解决「看不出能点」。
+3. i18n：新增 `scheme.switcher_hint`；`scheme.switcher_tip` 去掉「可搜索」；删除已无用的 `scheme.switcher_search`（中英同步）。
+
+**验证**：
+
+- 功能级：下拉项构造正确（禁用组标题无 userData、真实项覆盖全部方案、「未入列表」标注、「雾凇拼音 rime-ice」组标题用显示名）；程序化重建不发信号；选中真实项发一次、选中组标题不发、选中当前项不发；busy 禁用；无可用方案时显示占位并禁用。
+- 真实点击：复刻 `ComboBox._showComboMenu` 的菜单并用 QTest 点击「自然码双拼」→ 发出切换；点击禁用组标题 → 不发出。
+- 冒烟：`_check_scheme_switcher_ui` 按新实现重写（上述断言全内建）；整轮冒烟过 schema_switch/skin 后在 appearance 清理阶段被 safe-delete 钩子杀（已知环境限制），其余项经 `rerun_flow_checks.py` 分批补跑全过（window / skin_ui / appearance / appearance_ui / theme_import / animation / skin_flow / appearance_flow / runner / scheme_install_flow / snapshot_service / snapshot_cli / residue_clean）。
+- 离屏渲染核对：控制区视觉（分隔线 + 下拉 + 提示）与展开列表（组标题灰字、当前项 ✓、未入列表标注）。
+- 版本 1.0.39 → 1.0.40（config / smoke 断言 / README 徽章与功能表同步）。
+
+## v1.0.41 — 外观页新增「每页候选词数量」（rime 的 menu/page_size）
+
+**用户诉求**：方案部署完成后，输入时一页只有 5 个候选，希望做成可自己设置的选项。
+
+**机制核查（已核官方 CustomizationGuide + rime-ice 源码）**：
+
+- 每页候选数 = rime 的 `menu/page_size`，**是引擎配置、不是前端能力**——fcitx5-rime 与 ibus-rime 读同一个值，因此不像「候选窗主题」那样要分前端做两套。
+- 生效顺序：**方案自身 `.schema.yaml` 的 `menu/page_size` > 用户 `default.custom.yaml` 的 patch > 方案包自带的 `default.yaml` > 引擎默认 5**。雾凇（rime-ice）/ 白霜把 `page_size: 5` 写在自带的 `default.yaml` 里，所以用户 patch 能覆盖；但 oh-my-rime 这类把值写死在每个方案文件里的方案，全局 patch 对它无效——只写全局就是「设成 9 了却还是 6 个」的假成功。
+- 值域 1–9：第 10 个候选要靠 `0` 键选字，而选字键由方案的 `alternative_select_keys` 决定，前端行为不一致，故不开放 10。
+- `menu/page_size` 在部署时合入 `build/`，**改完必须重新部署**（与换皮肤同机制）。
+- 写法必须是带引号的扁平键 `"menu/page_size": 9`；嵌套 `menu: {page_size: 9}` 会整体顶替用户的 `menu` 段，把 `alternative_select_labels` / `alternative_select_keys` 一起冲掉（wiki 明确警告，rime-ice 的这两个键就在 menu 下）。
+
+**改动**：
+
+1. 新增 `core/candidate_count.py`：标记块读写（`# >>> rime-installer: page-size >>>`，与皮肤块、方案列表块在同一文件里互不覆盖）、`clamp`（1–9，越界/非法输入夹取）、`detect`（反读真实生效值：用户 patch → 当前方案自身 → 方案包 `default.yaml` → 5）、`schemas_with_own_page_size`（找出「方案文件里写死 page_size」的方案）、`write_page_size`（全局 patch + **顺带补写这些方案的 `<id>.custom.yaml`**）、`remove_page_size`（扫全部 `*.custom.yaml` 里的标记块并删除，只剩空壳时连文件一起删）、步骤构建（写配置 + `build_redeploy_steps`）。
+2. `tools/appearance_apply.py` 增加 `--rime-conf <dir> --page-size <1..9>` 与 `--revert-page-size`（复用现有 CLI 与退出码约定，不新增进程入口）。
+3. `ui/pages/appearance_page.py`：页面顶部新增「候选词数量」状态行；滚动区新增分区「候选窗（rime 引擎）」+ 卡片（1–9 下拉、`恢复默认`、两段说明、右侧自绘候选窗高度预览 `_CountPreview`——面板高度随行数增长，直观回答「9 个会不会太高」）。切换走 `combo.activated`（仅用户操作），刷新时 `blockSignals(True)` 重建；选中当前值且配置已由安装器持有则不发意图（避免无意义重部署 + 框架重启，v1.0.40 同一教训）。
+4. `core/state_machine.py` 新增 `appearance_page_size` 规则（需先识别到配置目录）；`ui/main_window.py` 接 `page_size_requested` / `page_size_revert_requested`，任务种类 `appearance-page-size` / `appearance-page-size-revert`（`_target_page` 已按 `appearance` 前缀分派，无需改），成功提示点名新数量。
+5. i18n 中英成对新增 18 个键（含 `msg.page_size_failed` + `_hint`），外观页副标题补上「每页候选数量」。
+6. 新增 `tools/render_appearance_page.py`（离屏渲染中/英两版，输出到 `design/mockups/appearance-page-size-{zh,en}.png`），用于核对长文案与预览挤压。
+
+**为什么放外观页而不是设置页 / 为什么是下拉不是滑块**：
+
+- 外观页已有 `ProgressAreaMixin` 与任务编排，主题切换的「改配置 → 重启框架」语义与这里完全一致；设置页是「程序自身偏好」（语言/深浅色/apt 源），且 `SettingsPage(PageBase)` 没有进度区，塞进去要另造一套。
+- 值域只有 9 个离散点：滑块难精确命中，数字框要处理空值/小数/粘贴垃圾；下拉零校验成本，还能在选项里直接写「5（默认）/ 7（推荐）/ 9（最多）」，顺带解决「我该选几」。
+
+**验证**：
+
+- `check_candidate_count`（新增，挂在 `appearance_ui` 之后）：clamp 三条边界；反读优先级（方案包 5 / 方案自身 6 / 已知方案不误取列表里其他方案的值）；写入后用户 `switcher/hotkeys` 与 `F4` 原样保留、标记块只出现一次、不写嵌套 `menu:`、方案级 `ohmy.custom.yaml` 被补写、`.rime-installer-bak` 备份落盘；重复写入是替换而非叠加；恢复默认后标记块消失、用户配置不变、值回到 5、方案级 custom 不残留空壳；步骤链为「写配置 + 重新部署」；UI 侧 9 档 `userData` 正确（`addItem` 第二参数是 icon 的坑）、当前值回填、意图只发一次、选中当前值不重复部署、busy 与「无配置目录」均禁用、「恢复默认」仅在写过时可用、方案级提示可见。
+- 离屏实跑：`check_i18n` / `check_appearance_ui` / `check_state_machine` / `check_window` / `check_appearance_flow` 全 OK；CLI 端到端（临时目录）写入 → 反读 → 恢复默认，退出码 0，用户配置字节级保留。
+- 视觉核对：`design/mockups/appearance-page-size-{zh,en}.png`（9 档预览最高时文字列不挤压、英文换行正常）。
+- 版本 1.0.40 → 1.0.41（config / smoke 断言 / README 徽章与功能表同步）。
+
+## v1.0.42 — 「每页候选词数量」控件重做（视觉返工）
+
+**反馈**：v1.0.41 的卡片「设计得不够好，下方有点空」。
+
+**诊断（对着离屏截图量的）**：
+
+| 现象 | 根因 |
+| --- | --- |
+| 左下角一大片空白 | 右侧预览 236×228 把卡片撑到 240px，左栏内容只有约 110px，且是**顶对齐**——多出来的 110px 全堆在文字下方 |
+| 预览里也有一块空 | 灰底「假桌面」比候选窗大一圈（上下各空 60~100px），空白被框在一个更显眼的底板里，读起来像没画完 |
+| 「最多能设几」仍要展开才知道 | 下拉收起后只看得到当前值，值域是隐藏信息 |
+| 「恢复默认」和下拉平级并排 | 一个是改动，一个是撤销，权重却一样 |
+
+**改动**：
+
+1. **下拉 → 1–9 刻度**：每格一个 `PillPushButton`（checkable + `QButtonGroup` 互斥），选中态是库自带的实心强调色胶囊。值域一眼可见、点一下即改，省掉「展开看有几项」这一步。5 / 7 / 9 三格带悬停说明（默认 / 推荐 / 上限，9 顺带交代「第 10 个要靠 0 键」的取舍）。
+2. **删掉大预览**：`_CountPreview` 整类移除。它不是没用，而是**这个尺寸下看不清**——134px 高要塞 9 行，字号只能压到 7–9px，中文候选词糊成一团；看不懂的装饰比没有更糟。高度信息改由「档位说明」一句话承担（「9 个 · 上限档位：一页看全，竖排已接近屏幕高度」）。
+3. **卡片改为单行控件行 + 两行说明**：`每页候选词数量  [1..9]  …… [恢复默认]` 一行，「当前档位含义」「部署/翻页键」两行。卡片高度 240 → 108，且两端都有内容锚点（左标题、右按钮），中间不再是空洞。
+4. **档位说明跟随点击变化**（`5 默认 / 7 推荐 / 9 上限 / 其余自定义`）：把「我该选几」从下拉后缀搬到正文里，选一下就能读到。
+5. 事件改走 `QButtonGroup.idClicked`（只在用户点击时发出；程序化 `setChecked` 不会误触发部署），语义与旧的 `activated` 一致；busy / 无配置目录时整组禁用，禁用原因写进各格 tooltip（原值在 `_page_size_tips` 里保存，恢复时不会残留上次的原因）。
+
+**为什么不留预览**：候选窗高度差 4 行 ≈ 100px，在 200px 宽的迷你图里只差 40px，读者量不出「会不会挡住屏幕」；而真正的判断依据是「我屏幕多高 + 我习惯看几个」，这不是缩略图能回答的。真要可视化，得按真实 DPI 画等比候选窗——那是另一个量级的实现，收益不抵。
+
+**验证**：
+
+- `check_candidate_count` 更新为刻度语义：9 格全覆盖 + 互斥 + 无配置时回填 5 + 「恢复默认」初始禁用 + 说明文案跟随；`QTest.mouseClick` **真实点击**证明「点当前档位不重复部署」「点相邻档位发出意图」（自组控件最容易点了没反应，这条不靠内部方法证明）；busy 与无目录整组禁用且 tooltip 给出原因。
+- 离屏实跑 `check_candidate_count` / `check_i18n` / `check_appearance_ui` / `check_state_machine` 全 OK。
+- 视觉核对：`tools/render_appearance_page.py` 出 `design/mockups/appearance-page-size-{zh,en}.png`（5 档）与 `-zh-9.png`（9 档），中英两版文字均不换行挤压，卡片高度 108px。
+- 版本 1.0.41 → 1.0.42（config / smoke 断言 / README 徽章与功能表同步）。

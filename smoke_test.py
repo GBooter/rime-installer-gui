@@ -25,7 +25,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import config  # noqa: E402
-from core import apt_mirror, compat, doctor, i18n, theme  # noqa: E402
+from core import apt_mirror, compat, doctor, i18n, residue, theme  # noqa: E402
 from core.apt_mirror import (  # noqa: E402
     Mirror,
     _codenames_from_text,
@@ -721,6 +721,13 @@ def check_state_machine() -> list[str]:
             errors.append(f"无引擎时 {action} 应禁用")
         if StateMachine(_report_with_engine()).rule(action).enabled is not True:
             errors.append(f"有引擎时 {action} 应可用")
+    # v1.0.38：方案切换同样要求先装引擎（重启框架/部署才有意义）
+    if StateMachine(_report_no_engine()).rule("switch_scheme").enabled is not False:
+        errors.append("无引擎时 switch_scheme 应禁用")
+    if "引擎" not in StateMachine(_report_no_engine()).rule("switch_scheme").reason:
+        errors.append("switch_scheme 禁用原因应提示先装引擎")
+    if StateMachine(_report_with_engine()).rule("switch_scheme").enabled is not True:
+        errors.append("有引擎时 switch_scheme 应可用")
     if StateMachine(_report_with_engine()).rule("switch_mirror").enabled is not True:
         errors.append("Ubuntu 上 switch_mirror 应可用")
     deepin_rule = StateMachine(_report_no_rime_dir()).rule("switch_mirror")
@@ -1204,6 +1211,7 @@ def check_doctor() -> list[str]:
         "input_source",
         "autostart",
         "rime_dir",
+        "residue",
         "apt_codename",
         "apt_sources",
     ):
@@ -1315,13 +1323,30 @@ def check_doctor() -> list[str]:
     if not frontend_steps or "setsid" not in " ".join(frontend_steps[0].argv):
         errors.append("框架启动步骤必须 setsid 脱离进程组（否则 runner 永不完成）")
 
+    # v1.0.37：deployed 修复在缺 rime_deployer 时前置 librime-bin 安装步
+    # （best-effort，装不上不判失败）——断言要能在两步里找到部署步
     deploy_steps = build_fix_steps("deployed", report)
-    deploy_cmd = " ".join(deploy_steps[0].argv) if deploy_steps else ""
-    if not deploy_steps or "build" not in deploy_cmd:
+    deploy_cmd = " ".join(" ".join(s.argv) for s in deploy_steps)
+    deploy_only = next(
+        (s for s in deploy_steps if "rime_deployer" in " ".join(s.argv) or "未找到" in " ".join(s.argv)),
+        None,
+    )
+    if deploy_only is None or "build" not in " ".join(deploy_only.argv):
         errors.append("部署修复步骤应清理 build 目录")
     # v1.0.6：必须主动编译（rime_deployer），异常裁剪系统才退回重启框架
-    if deploy_steps and "rime_deployer" not in deploy_cmd and "未找到" not in deploy_cmd:
+    if deploy_only is not None and "rime_deployer" not in " ".join(deploy_only.argv) and "未找到" not in " ".join(deploy_only.argv):
         errors.append(f"部署修复步骤应主动调用 rime_deployer: {deploy_cmd[:120]}")
+    # v1.0.37：缺 deployer 时先 best-effort 装 librime-bin（含 apt update 容错）
+    orig_finder = doctor.find_deployer
+    try:
+        doctor.find_deployer = lambda: None
+        no_deployer_steps = build_fix_steps("deployed", report)
+    finally:
+        doctor.find_deployer = orig_finder
+    if len(no_deployer_steps) < 2 or "librime-bin" not in " ".join(no_deployer_steps[0].argv):
+        errors.append("缺 rime_deployer 时 deployed 修复应前置 librime-bin 安装步")
+    if "|| echo" not in " ".join(no_deployer_steps[0].argv):
+        errors.append("librime-bin 安装步必须 best-effort（装不上只警告）")
     # v1.0.26：编译到 staging，失败保留原 build 并 exit 1（Ubuntu 无 librime-bin 时
     # 旧实现会「删掉可用 build + 报成功」，属拒绝过的假成功）
     if ".rime-new" not in deploy_cmd:
@@ -1330,8 +1355,30 @@ def check_doctor() -> list[str]:
         errors.append("部署修复失败必须 exit 1，不得以 0 谎报成功")
     if deploy_cmd.find('rm -rf "$NEW"') > deploy_cmd.find('rm -rf "$BUILD"'):
         errors.append("部署脚本必须先清理 staging、成功后才替换 build")
-    if 'rm -rf "$BUILD"' in deploy_cmd.split("if [ -n \"$DEPLOYER\" ]")[0]:
+    if 'rm -rf "$BUILD"' in deploy_cmd.split('if [ -n "$DEPLOYER" ]')[0]:
         errors.append("部署脚本不得在判断 deployer 之前删除 build")
+    # v1.0.37：可写预检（两种模式都有）
+    if "deploy-probe" not in deploy_cmd or "不可写" not in deploy_cmd:
+        errors.append("部署脚本应含配置目录可写预检（root 残留给 chown 指引）")
+    # v1.0.37：强制全量重建 + 轮询验真只在非测试模式分支——临时切真实
+    # 模式构建一次来断言（不执行，只看内容）
+    saved_no_restart = os.environ.get("RIME_INSTALLER_NO_RESTART")
+    os.environ.pop("RIME_INSTALLER_NO_RESTART", None)
+    try:
+        live_cmd = " ".join(
+            " ".join(s.argv) for s in build_fix_steps("deployed", report)
+        )
+    finally:
+        if saved_no_restart is None:
+            os.environ.pop("RIME_INSTALLER_NO_RESTART", None)
+        else:
+            os.environ["RIME_INSTALLER_NO_RESTART"] = saved_no_restart
+    if "default.custom.yaml" not in live_cmd or "强制重新部署标记" not in live_cmd:
+        errors.append("框架兜底应给 default.custom.yaml 追加强制重建标记")
+    if "newermt" not in live_cmd or "-lt 30" not in live_cmd:
+        errors.append("兜底轮询应验真 build 被刷新（find -newermt，30s 超时）")
+    if "sleep 1" not in live_cmd:
+        errors.append("兜底轮询应每秒检查一次")
     # v1.0.26：冒烟/自动化必须以 RIME_INSTALLER_NO_RESTART=1 构建脚本。真机教训：
     # 跑真部署脚本时 `pkill -x fcitx5` 把开发者本机的输入法杀掉了。
     if os.environ.get("RIME_INSTALLER_NO_RESTART") == "1" and "pkill" in deploy_cmd:
@@ -1944,6 +1991,390 @@ def check_deploy_guide() -> list[str]:
     # v1.0.8：共享数据目录需运行时二次探测（Deepin 等发行版路径可能不同）
     if "rime_deployer" in cmd and 'SHARED=' not in cmd:
         errors.append("部署脚本应包含共享数据目录运行时探测（SHARED）")
+    # v1.0.37：独立「重新部署」不提权——缺 deployer 时的 librime-bin 安装
+    # 只进体检的 deployed 修复（那里本就有密码框预期），避免按钮点一下
+    # 就弹密码框的惊吓。只查 pkexec（提权机制本体）；失败提示文案里出现
+    # 的 librime-bin 字样不算。
+    if "pkexec" in cmd:
+        errors.append(f"独立重新部署不应提权: {cmd[:120]}")
+    # v1.0.37：可写预检（root 属主残留的直接报障点）
+    if "deploy-probe" not in cmd or "chown" not in cmd:
+        errors.append("部署脚本应含配置目录可写预检与 chown 指引")
+    return errors
+
+
+def check_residue() -> list[str]:
+    """v1.0.37：手动安装残留检测 + 清理步骤构建（纯逻辑，不执行）。
+
+    覆盖三类残留的检出/不误报、sed 模式转义（``a.b`` 不得匹配 ``axb``）、
+    共享配置失效引用只报告不动手，以及清理脚本的关键结构（备份、chown
+    护栏、sed 行删除、staging 清理）。
+    """
+    errors: list[str] = []
+    base = _tmp_dir("residue-")
+    try:
+        rime = base / "rime"
+        rime.mkdir()
+        if residue.scan(rime):
+            errors.append("干净目录被误报残留")
+        if residue.scan(None) or residue.scan(base / "nope"):
+            errors.append("目录不存在/未识别时应无残留")
+
+        (rime / residue.STAGING_NAME).mkdir()
+        (rime / "default.custom.yaml").write_text(
+            "patch:\n"
+            "  schema_list:\n"
+            "    - schema: good\n"
+            "    - schema: gone\n"
+            '    - schema: "quoted"\n'
+            "    - schema: a.b\n"
+            "    - schema: axb\n",
+            encoding="utf-8",
+        )
+        for name in ("good", "axb"):
+            (rime / f"{name}.schema.yaml").write_text(
+                f"schema:\n  schema_id: {name}\n", encoding="utf-8"
+            )
+        items = residue.scan(rime)
+        tally = residue.counts(items)
+        if tally.get(residue.STAGING) != 1:
+            errors.append(f"暂存残留未检出: {tally}")
+        stale = sorted(i.ref for i in items if i.kind == residue.STALE_SCHEMA)
+        if stale != ["a.b", "gone", "quoted"]:
+            errors.append(f"失效引用未检出或 ref 缺失: {stale}")
+        if any(i.manual for i in items if i.kind == residue.STALE_SCHEMA):
+            errors.append("用户文件里的失效引用应可自动清理")
+        if tally.get(residue.FOREIGN_OWNER):
+            errors.append("当前用户自己的文件不应判属主异常")
+
+        # 共享配置里的失效引用：只报告（manual），不进自动清理
+        rime2 = base / "rime2"
+        rime2.mkdir()
+        shared = base / "share"
+        shared.mkdir()
+        (shared / "luna_pinyin.schema.yaml").write_text(
+            "schema:\n  schema_id: luna_pinyin\n", encoding="utf-8"
+        )
+        (shared / "default.yaml").write_text(
+            "schema_list:\n  - schema: luna_pinyin\n  - schema: gone2\n",
+            encoding="utf-8",
+        )
+        items2 = residue.scan(rime2, shared)
+        shared_stale = [i for i in items2 if i.kind == residue.SHARED_STALE]
+        if len(shared_stale) != 1 or not shared_stale[0].manual:
+            errors.append(f"共享配置失效引用应只报告: {[i.kind for i in items2]}")
+        if residue.cleanable(items2):
+            errors.append("只有 manual 项时不应生成清理步骤")
+        # 用户 custom 的 list 整体顶替共享 list（rime patch 语义）：
+        # 共享里的 gone2 被 mask 掉，不应再报
+        (rime2 / "default.custom.yaml").write_text(
+            "patch:\n  schema_list:\n    - schema: mine\n", encoding="utf-8"
+        )
+        (rime2 / "mine.schema.yaml").write_text("schema:\n  schema_id: mine\n", encoding="utf-8")
+        if residue.scan(rime2, shared):
+            errors.append("用户 custom list 顶替后不应再报共享 list 的失效引用")
+
+        # 清理步骤结构（补一个 foreign_owner 项验证 chown 步；当前用户的
+        # 文件造不出属主异常，非 root 环境无法 chown 出 root 文件）
+        steps = residue.build_clean_steps(
+            items
+            + [residue.ResidueItem(residue.FOREIGN_OWNER, "d", str(rime))],
+            rime,
+            "fcitx5-rime",
+            home=base,
+        )
+        titles = [s.title for s in steps]
+        if not titles or "打包配置快照" not in titles[0]:
+            errors.append(f"清理应先行备份: {titles}")
+        cmd = " ".join(" ".join(s.argv) for s in steps)
+        if "chown" not in cmd or 'id -u' not in cmd:
+            errors.append("属主残留应生成 chown 步（数值 uid/gid）")
+        if 'case "$DIR" in' not in cmd or "不在主目录下" not in cmd:
+            errors.append("chown 步必须有家目录护栏")
+        if "sed -i" not in cmd:
+            errors.append("失效引用清理应走 sed 行删除")
+        if residue.BACKUP_SUFFIX not in cmd:
+            errors.append("改 yaml 前必须留 .rime-installer-bak 备份")
+        if "a\\.b" not in cmd:
+            errors.append(f"sed 模式必须转义 id 中的正则元字符: {cmd[:200]}")
+        if residue.STAGING_NAME not in cmd:
+            errors.append("清理步应删除暂存目录")
+        # 没有可自动处理项 → 空步骤
+        if residue.build_clean_steps(
+            [i for i in items2 if i.manual], rime, "fcitx5-rime"
+        ):
+            errors.append("只有 manual 项时 build_clean_steps 应为空")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return errors
+
+
+def check_residue_clean() -> list[str]:
+    """v1.0.37：残留清理端到端（runner 真跑 QProcess）。
+
+    与 check_snapshot_cli 同款：真执行。备份 dest 显式导到临时目录，
+    不污染真机备份列表。chown 步需要 foreign_owner 文件（root 才能造），
+    非 root 环境跳过该步的执行断言（步骤构建由 check_residue 覆盖）。
+    """
+    errors: list[str] = []
+    base = _tmp_dir("residue-clean-")
+    try:
+        rime = base / "rime"
+        rime.mkdir()
+        (rime / "default.custom.yaml").write_text(
+            "patch:\n"
+            "  schema_list:\n"
+            "    - schema: good\n"
+            "    - schema: gone\n"
+            "    - schema: a.b\n"
+            "    - schema: axb\n",
+            encoding="utf-8",
+        )
+        for name in ("good", "axb"):
+            (rime / f"{name}.schema.yaml").write_text(
+                f"schema:\n  schema_id: {name}\n", encoding="utf-8"
+            )
+        (rime / residue.STAGING_NAME).mkdir()
+        (rime / residue.STAGING_NAME / "junk").write_text("x")
+        backups = base / "backups"
+        items = residue.scan(rime)
+        steps = residue.build_clean_steps(
+            items, rime, "fcitx5-rime", home=base, dest_dir=backups
+        )
+        result = _run_steps_sync(TaskRunner(), steps, timeout_ms=60000)
+        if result["ok"] is not True:
+            errors.append(f"残留清理失败（code={result['code']}）: {result['lines'][-3:]}")
+            return errors
+        text = (rime / "default.custom.yaml").read_text(encoding="utf-8")
+        if "gone" in text or "a.b" in text:
+            errors.append(f"失效引用未被清除: {text!r}")
+        if "good" not in text or "axb" not in text:
+            errors.append(f"误删了有效引用: {text!r}")
+        bak = rime / ("default.custom.yaml" + residue.BACKUP_SUFFIX)
+        if not bak.is_file() or "gone" not in bak.read_text(encoding="utf-8"):
+            errors.append("改前备份缺失或内容不对")
+        if (rime / residue.STAGING_NAME).exists():
+            errors.append("暂存目录未被清理")
+        zips = sorted(backups.glob("*.zip"))
+        if len(zips) != 1:
+            errors.append(f"清理前备份产物异常: {zips}")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return errors
+
+
+def check_schema_switch() -> list[str]:
+    """v1.0.38：方案切换核心——检测/列表/步骤构建/yaml 三形态改写（真跑 bash）。
+
+    yaml 改写脚本用 subprocess 真跑（与方案装卸流程同款离线可重复），
+    断言三种形态下用户其余配置字节级保留、改前留 .bak。
+    """
+    errors: list[str] = []
+    from core import schema_switch as ss
+
+    base = _tmp_dir("schema-switch-")
+    try:
+        rime = base / "rime"
+        rime.mkdir()
+        shared = base / "share"
+        shared.mkdir()
+        (shared / "luna_pinyin.schema.yaml").write_text(
+            "schema:\n  name: 朙月拼音\n  schema_id: luna_pinyin\n", encoding="utf-8"
+        )
+        (shared / "terra_pinyin.schema.yaml").write_text(
+            "schema:\n  name: 地球拼音\n", encoding="utf-8"
+        )
+        (shared / "default.yaml").write_text(
+            "schema_list:\n  - schema: luna_pinyin\n  - schema: terra_pinyin\n",
+            encoding="utf-8",
+        )
+        (rime / "rime_ice.schema.yaml").write_text(
+            "schema:\n  name: 雾凇拼音\n  schema_id: rime_ice\n", encoding="utf-8"
+        )
+
+        # ---- 检测：显式 / 未设置回落第一项 / 失效 id 回落第一项 ----
+        if ss.detect_active_schema(rime, shared) != "luna_pinyin":
+            errors.append("无 user.yaml 时应回落 schema_list 第一项")
+        (rime / "user.yaml").write_text(
+            "var:\n  previously_selected_schema: terra_pinyin\n", encoding="utf-8"
+        )
+        if ss.detect_active_schema(rime, shared) != "terra_pinyin":
+            errors.append("显式 previously_selected_schema 未读到")
+        # 指向不在列表里的方案：rime 实际也用不了它，回落第一项
+        (rime / "user.yaml").write_text(
+            "var:\n  previously_selected_schema: gone\n", encoding="utf-8"
+        )
+        if ss.detect_active_schema(rime, shared) != "luna_pinyin":
+            errors.append("指向失效方案时应回落第一项（rime 实际行为）")
+
+        # ---- 列表：用户目录 + 共享目录，来源标注 ----
+        items = ss.list_switchable(rime, shared, installer_ids={"rime_ice"})
+        by_id = {i.id: i for i in items}
+        if set(by_id) != {"rime_ice", "luna_pinyin", "terra_pinyin"}:
+            errors.append(f"可切换列表缺失: {sorted(by_id)}")
+        if by_id["rime_ice"].source != "installer" or by_id["rime_ice"].name != "雾凇拼音":
+            errors.append(f"manifest 记账方案应为 installer 且读到显示名: {by_id['rime_ice']}")
+        if by_id["luna_pinyin"].source != "shared":
+            errors.append(f"共享目录方案应为 shared: {by_id['luna_pinyin']}")
+        if by_id["rime_ice"].in_list:
+            errors.append("未入列的方案 in_list 应为 False")
+
+        # ---- v1.0.39：按方案包分组（胶囊墙 → 下拉菜单的数据基础） ----
+        pkg_items = [
+            ss.SwitchableSchema("rime_ice", "雾凇拼音", "installer", True),
+            ss.SwitchableSchema("xiaohe", "小鹤双拼", "installer", True),
+            ss.SwitchableSchema("luna_pinyin", "朙月拼音", "installer", True),
+            ss.SwitchableSchema("luna_pinyin_simp", "朙月拼音·简化字", "installer", True),
+            ss.SwitchableSchema("bopomofo", "注音", "installer", True),
+            ss.SwitchableSchema("hand_one", "手装方案", "manual", False),
+        ]
+        groups = ss.group_by_package(
+            pkg_items,
+            package_schemas={
+                "iDvel/rime-ice": ["rime_ice", "xiaohe"],
+                "official:luna-pinyin": ["luna_pinyin", "luna_pinyin_simp"],
+                "official:bopomofo": ["bopomofo"],
+            },
+            package_names={
+                "iDvel/rime-ice": "雾凇拼音 rime-ice",
+                "official:luna-pinyin": "明月拼音",
+                "official:bopomofo": "注音",
+            },
+            group_titles={
+                "manual": "手动安装",
+                "shared": "系统共享",
+                "other": "其他",
+            },
+        )
+        # 分组不得丢条目
+        grouped_ids = [s.id for g in groups for s in g.items]
+        if sorted(grouped_ids) != sorted(s.id for s in pkg_items):
+            errors.append(f"分组后有条目丢失: {sorted(grouped_ids)}")
+        if len(grouped_ids) != len(set(grouped_ids)):
+            errors.append(f"分组后有条目重复: {grouped_ids}")
+        # 方案包组标题用显示名（不是 key）
+        ice_group = next((g for g in groups if g.key == "iDvel/rime-ice"), None)
+        if ice_group is None:
+            errors.append("应存在雾凇包分组")
+        elif ice_group.title != "雾凇拼音 rime-ice":
+            errors.append(f"包分组标题应为显示名: {ice_group.title}")
+        # 同一包内的变体应收在同一组内，且主方案在前
+        luna_group = next((g for g in groups if g.key == "official:luna-pinyin"), None)
+        if luna_group is None:
+            errors.append("应存在朙月包分组")
+        elif [s.id for s in luna_group.items] != ["luna_pinyin", "luna_pinyin_simp"]:
+            errors.append(f"朙月包变体应收在一组且主方案在前: {luna_group.items}")
+        # 无包归属的方案归入手动组，且不与安装器方案混组
+        manual_group = next((g for g in groups if g.source == "manual"), None)
+        if manual_group is None or [s.id for s in manual_group.items] != ["hand_one"]:
+            errors.append(f"手装方案应独立成组: {manual_group}")
+        if any(s.source != "installer" for g in groups if g.source == "installer" for s in g.items):
+            errors.append("安装器分组内不应混入手装方案")
+        # 无包归属映射时（manifest 查不到）应全部归入手动/共享组，不得丢失
+        loose = ss.group_by_package(pkg_items)
+        if len([s for g in loose for s in g.items]) != len(pkg_items):
+            errors.append("无包映射时分组不得丢条目")
+
+        # ---- 步骤构建：入列与否决定步数 ----
+        steps = ss.build_switch_steps("rime_ice", rime, "fcitx5-rime", shared)
+        if len(steps) != 3 or "加入可选方案列表" not in steps[0].title:
+            errors.append(f"未入列应三步且首步入列: {[s.title for s in steps]}")
+        steps_in = ss.build_switch_steps("luna_pinyin", rime, "fcitx5-rime", shared)
+        if len(steps_in) != 2:
+            errors.append(f"已在列表应两步: {[s.title for s in steps_in]}")
+        redeploy_cmd = " ".join(" ".join(s.argv) for s in steps_in)
+        if "build" not in redeploy_cmd:
+            errors.append("切换链应复用部署引导（编译 + 重启框架）")
+        try:
+            ss.build_switch_steps("we'ird", rime, "fcitx5-rime", shared)
+            errors.append("含引号的方案 id 应拒绝构建")
+        except ValueError:
+            pass
+
+        # ---- 形态 A：custom 不存在 → 新建，列表 = base + 目标 ----
+        script = ss._ensure_in_list_script(rime, shared, "rime_ice")
+        (base / "a.sh").write_text(script)
+        result = subprocess.run(
+            ["bash", str(base / "a.sh")], capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            errors.append(f"入列脚本失败: {result.stderr[-200:]}")
+            return errors
+        text = (rime / "default.custom.yaml").read_text(encoding="utf-8")
+        if "- schema: luna_pinyin" not in text or "- schema: rime_ice" not in text:
+            errors.append(f"新建 custom 应带 base 列表 + 目标: {text!r}")
+
+        # ---- 形态 B：已有 schema_list → 追加（不重写其他内容） ----
+        (rime / "terra_pinyin.schema.yaml").write_text(
+            "schema:\n  name: 地球拼音\n", encoding="utf-8"
+        )
+        script = ss._ensure_in_list_script(rime, shared, "terra_pinyin")
+        (base / "b.sh").write_text(script)
+        subprocess.run(["bash", str(base / "b.sh")], capture_output=True, timeout=30)
+        text = (rime / "default.custom.yaml").read_text(encoding="utf-8")
+        if text.count("- schema: rime_ice") != 1 or "- schema: terra_pinyin" not in text:
+            errors.append(f"追加应只加一行且不动已有条目: {text!r}")
+        if "- schema: luna_pinyin" not in text:
+            errors.append("追加时弄丢了 base 列表条目")
+
+        # ---- 形态 C：custom 无 schema_list → 插入整列表，其余内容保留 ----
+        (rime / "default.custom.yaml").write_text(
+            "patch:\n  style:\n    color_scheme: x\n", encoding="utf-8"
+        )
+        script = ss._ensure_in_list_script(rime, shared, "rime_ice")
+        (base / "c.sh").write_text(script)
+        subprocess.run(["bash", str(base / "c.sh")], capture_output=True, timeout=30)
+        text = (rime / "default.custom.yaml").read_text(encoding="utf-8")
+        if "color_scheme: x" not in text:
+            errors.append(f"插入列表时丢了用户的 style 配置: {text!r}")
+        for want in ("- schema: luna_pinyin", "- schema: terra_pinyin", "- schema: rime_ice"):
+            if want not in text:
+                errors.append(f"插入的整列表缺少 {want}: {text!r}")
+        bak = rime / ("default.custom.yaml" + ".rime-installer-bak")
+        if not bak.is_file() or "color_scheme" not in bak.read_text(encoding="utf-8"):
+            errors.append("改前备份缺失或内容不对")
+
+        # ---- user.yaml 三态：新建 / 有 var 无键 / 替换值 ----
+        (rime / "user.yaml").unlink(missing_ok=True)
+        script = ss._set_active_script(rime, "rime_ice")
+        (base / "u1.sh").write_text(script)
+        subprocess.run(["bash", str(base / "u1.sh")], capture_output=True, timeout=30)
+        if "previously_selected_schema: rime_ice" not in (
+            rime / "user.yaml"
+        ).read_text(encoding="utf-8"):
+            errors.append("user.yaml 新建失败")
+        (rime / "user.yaml").write_text("var:\n  schema_list: []\n", encoding="utf-8")
+        script = ss._set_active_script(rime, "terra_pinyin")
+        (base / "u2.sh").write_text(script)
+        subprocess.run(["bash", str(base / "u2.sh")], capture_output=True, timeout=30)
+        text = (rime / "user.yaml").read_text(encoding="utf-8")
+        if "previously_selected_schema: terra_pinyin" not in text or "schema_list" not in text:
+            errors.append(f"有 var 无键时应插入且保留原内容: {text!r}")
+        script = ss._set_active_script(rime, "rime_ice")
+        (base / "u3.sh").write_text(script)
+        subprocess.run(["bash", str(base / "u3.sh")], capture_output=True, timeout=30)
+        text = (rime / "user.yaml").read_text(encoding="utf-8")
+        if text.count("previously_selected_schema") != 1 or "rime_ice" not in text:
+            errors.append(f"替换应只改值不堆键: {text!r}")
+        if ss.detect_active_schema(rime, shared) != "rime_ice":
+            errors.append("写入后反读不一致")
+
+        # ---- manifest files → schema_id 映射（卡片「启用」按钮的数据源） ----
+        manifest = Manifest(base / "m.db", base / "snap")
+        try:
+            package_id = manifest.add_package(
+                "k1", "方案一", "user/repo", "fcitx5-rime", rime, base / "snap1", "hash"
+            )
+            manifest.record_files(
+                package_id, ["rime_ice.schema.yaml", "rime_ice.dict.yaml"], []
+            )
+            files = manifest.package_files("k1")
+            if "rime_ice.schema.yaml" not in files or "rime_ice.dict.yaml" not in files:
+                errors.append(f"package_files 记录缺失: {files}")
+        finally:
+            manifest.close()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
     return errors
 
 
@@ -3033,6 +3464,130 @@ def check_skin_ui() -> list[str]:
         normal.deleteLater()
     finally:
         i18n.set_language(original)
+    errors.extend(_check_scheme_switcher_ui())
+    return errors
+
+
+def _check_scheme_switcher_ui() -> list[str]:
+    """v1.0.40：方案切换器 UI（标准下拉框，取代 v1.0.39 的自定义菜单）。
+
+    断言要点：
+    - 页面不再有胶囊墙（v1.0.38 的 ``_switch_chips_*`` 已移除）；
+    - 控件本身显示当前方案（带 ✓），状态行不再重复一行「当前方案」文字；
+    - 下拉项按方案包分组（组标题为**禁用项**），真实项 userData = schema_id；
+    - 选中真实项发 ``switch_requested``；选中分组标题/当前项**不发**；
+    - 程序化重建（刷新状态）**不得**触发切换；
+    - busy 时下拉禁用；无可用方案时显示占位并禁用。
+    """
+    errors: list[str] = []
+    from core.detector import EnvReport
+    from core.schema_switch import SwitchableSchema
+    from core.state_machine import StateMachine
+    from qfluentwidgets import BodyLabel
+    from ui.pages.scheme_page import SchemePage
+
+    report = EnvReport(
+        recommended_frontend="fcitx5-rime",
+        engine_packages={"fcitx5-rime": True},
+    )
+    page = SchemePage(report, StateMachine(report))
+
+    # 胶囊墙已移除
+    if hasattr(page, "_switch_chips"):
+        errors.append("v1.0.39+：胶囊墙应已移除")
+    if hasattr(page, "_switch_chips_host"):
+        errors.append("v1.0.39+：胶囊墙宿主应已移除")
+
+    picked: list[str] = []
+    page.switch_requested.connect(picked.append)
+
+    switcher = page.schema_switcher
+    combo = switcher.combo
+    items = [
+        SwitchableSchema("rime_ice", "雾凇拼音", "installer", True),
+        SwitchableSchema("xiaohe", "小鹤双拼", "installer", True),
+        SwitchableSchema("luna_pinyin", "朙月拼音", "installer", True),
+        SwitchableSchema("hand_one", "手装方案", "manual", False),
+    ]
+    page.set_schema_ids(
+        {
+            "iDvel/rime-ice": ["rime_ice", "xiaohe"],
+            "official:luna-pinyin": ["luna_pinyin"],
+        }
+    )
+    page.set_switchable_state(items, "rime_ice")
+
+    # 控件显示当前方案（✓ 前缀 + 方案名）
+    text = combo.currentText()
+    if "雾凇拼音" not in text:
+        errors.append(f"下拉框应显示当前方案名: {text!r}")
+    if not text.startswith("✓"):
+        errors.append(f"当前方案应带 ✓ 标识: {text!r}")
+
+    # 状态行不再重复表达「当前方案」（行内不应有只读值标签）
+    row = page.current_schema_row
+    widgets = [row.itemAt(i).widget() for i in range(row.count())]
+    for w in widgets:
+        if isinstance(w, BodyLabel) and "雾凇拼音" in w.text():
+            errors.append("「当前方案」行不应再有重复的值标签")
+
+    # 分组：组标题为禁用项，真实项 userData = schema_id
+    if not switcher._groups:
+        errors.append("切换器应有分组数据")
+    headers = [it for it in combo.items if not it.isEnabled]
+    real = [it for it in combo.items if it.isEnabled]
+    if not headers:
+        errors.append("下拉项应包含分组的禁用标题")
+    if any(it.userData for it in headers):
+        errors.append("分组标题项不应带 schema_id")
+    if {it.userData for it in real} != {"rime_ice", "xiaohe", "luna_pinyin", "hand_one"}:
+        errors.append(f"真实项 userData 应覆盖全部方案: {[i.userData for i in real]}")
+    if not any("未入列表" in it.text for it in real):
+        errors.append("不在可选列表的方案应在下拉项里标注")
+    if "雾凇拼音 rime-ice" not in " ".join(it.text for it in headers):
+        errors.append("分组标题应用方案包显示名")
+
+    # 程序化重建（刷新状态）不得触发切换
+    if picked:
+        errors.append(f"刷新状态不应触发切换: {picked}")
+
+    # 选中真实项 → 发出切换
+    idx = next(i for i, it in enumerate(combo.items) if it.userData == "xiaohe")
+    combo.setCurrentIndex(idx)
+    combo.activated.emit(idx)
+    if picked != ["xiaohe"]:
+        errors.append(f"选中方案应发出切换意图: {picked}")
+
+    # 选中分组标题 → 不发
+    header_idx = next(i for i, it in enumerate(combo.items) if not it.isEnabled)
+    combo.activated.emit(header_idx)
+    if picked != ["xiaohe"]:
+        errors.append(f"点击分组标题不应触发切换: {picked}")
+
+    # 选中当前生效项 → 不发（避免无意义的部署重启）
+    page.set_switchable_state(items, "xiaohe")
+    picked.clear()
+    cur_idx = next(i for i, it in enumerate(combo.items) if it.userData == "xiaohe")
+    combo.activated.emit(cur_idx)
+    if picked:
+        errors.append(f"选中当前方案不应重复触发切换: {picked}")
+
+    # busy 协议：执行期下拉禁用
+    switcher.set_busy(True)
+    if combo.isEnabled():
+        errors.append("busy 时切换器应禁用")
+    switcher.set_busy(False)
+    if not combo.isEnabled():
+        errors.append("非 busy 时切换器应可用")
+
+    # 无可用方案：占位 + 禁用
+    page.set_switchable_state([], "")
+    if combo.isEnabled():
+        errors.append("无可用方案时下拉应禁用")
+    if combo.currentText():
+        errors.append(f"无可用方案时应显示占位文案而非方案名: {combo.currentText()!r}")
+
+    page.deleteLater()
     return errors
 
 
@@ -3690,6 +4245,214 @@ def _run_steps_sync(runner, steps, timeout_ms=20000, cancel_after_ms=None) -> di
     runner.progress.disconnect(_on_prog)
     runner.finished.disconnect(_on_fin)
     return result
+
+
+def check_candidate_count() -> list[str]:
+    """候选词数量（v1.0.41）：menu/page_size 的读写、方案级补丁、UI 回填与意图。"""
+    errors: list[str] = []
+    from core import appearance, candidate_count, i18n
+    from core.detector import EnvReport
+    from core.state_machine import StateMachine
+    from ui.pages.appearance_page import AppearancePage
+
+    base = _tmp_dir("candidate-count-")
+    rime = base / "rime"
+    rime.mkdir()
+    # 方案包自带的全局配置（雾凇 / 白霜同款：page_size 写在 default.yaml 的 menu 段）
+    (rime / "default.yaml").write_text(
+        "schema_list:\n  - schema: rime_ice\n  - schema: ohmy\n\nmenu:\n  page_size: 5\n",
+        encoding="utf-8",
+    )
+    # 用户已有的配置：必须字节级保留（不能被候选数写入冲掉）
+    custom = rime / "default.custom.yaml"
+    custom.write_text(
+        "# 用户自己的配置\npatch:\n  schema_list:\n    - schema: rime_ice\n"
+        "    - schema: ohmy\n  switcher/hotkeys:\n    - F4\n",
+        encoding="utf-8",
+    )
+    (rime / "rime_ice.schema.yaml").write_text(
+        "schema:\n  schema_id: rime_ice\n  name: 雾凇拼音\n", encoding="utf-8"
+    )
+    # 少数方案把 page_size 写死在自己的方案文件里（oh-my-rime 实证）——
+    # 全局 patch 对它无效，必须补方案级 custom，否则就是「设了没变」的假成功
+    (rime / "ohmy.schema.yaml").write_text(
+        "schema:\n  schema_id: ohmy\n  name: 方案B\nmenu:\n  page_size: 6\n",
+        encoding="utf-8",
+    )
+
+    # ---- 值域 ----
+    if candidate_count.clamp(0) != candidate_count.PAGE_SIZE_MIN:
+        errors.append("clamp 未把 0 夹到下限")
+    if candidate_count.clamp(20) != candidate_count.PAGE_SIZE_MAX:
+        errors.append("clamp 未把 20 夹到上限（10 需要 0 键选字，不开放）")
+    if candidate_count.clamp("x") != candidate_count.PAGE_SIZE_DEFAULT:
+        errors.append("clamp 对非法输入应回退默认值")
+
+    # ---- 反读优先级：用户 patch > 方案自身 > 方案包 default.yaml ----
+    if candidate_count.detect(rime, "rime_ice") != 5:
+        errors.append("无用户 patch 时应取方案包 default.yaml 的 5")
+    if candidate_count.detect(rime, "ohmy") != 6:
+        errors.append("方案自身写死的 page_size 应优先于 default.yaml")
+    if candidate_count.schemas_with_own_page_size(rime) != ["ohmy"]:
+        errors.append(
+            f"方案级覆盖清单异常: {candidate_count.schemas_with_own_page_size(rime)}"
+        )
+    if candidate_count.has_own_block(rime):
+        errors.append("未写入时不应判定为「安装器写过配置」")
+
+    # ---- 写入：全局 + 方案级，且不动用户其他配置 ----
+    candidate_count.write_page_size(rime, 9)
+    text = custom.read_text(encoding="utf-8")
+    if "switcher/hotkeys" not in text or "F4" not in text:
+        errors.append("写入候选数时破坏了用户已有配置")
+    if text.count('"menu/page_size"') != 1:
+        errors.append("标记块应只出现一次")
+    if "menu:\n  page_size" in text:
+        errors.append("必须写扁平键：嵌套 menu 段会顶替用户整个 menu 配置")
+    scoped = rime / "ohmy.custom.yaml"
+    if not scoped.is_file() or '"menu/page_size": 9' not in scoped.read_text(
+        encoding="utf-8"
+    ):
+        errors.append("自带 page_size 的方案应补写方案级 custom")
+    if candidate_count.detect(rime, "rime_ice") != 9:
+        errors.append("写入后应反读到 9")
+    if not candidate_count.has_own_block(rime):
+        errors.append("写入后 has_own_block 应为 True")
+    if not (rime / "default.custom.yaml.rime-installer-bak").is_file():
+        errors.append("改写前应留 .rime-installer-bak 备份（非 .yaml 后缀）")
+    candidate_count.write_page_size(rime, 7)
+    if custom.read_text(encoding="utf-8").count('"menu/page_size"') != 1:
+        errors.append("重复写入时应替换标记块而不是叠加")
+
+    # ---- 恢复默认 ----
+    candidate_count.remove_page_size(rime)
+    if candidate_count.has_own_block(rime):
+        errors.append("恢复默认后不应再有安装器标记块")
+    if "switcher/hotkeys" not in custom.read_text(encoding="utf-8"):
+        errors.append("恢复默认时破坏了用户已有配置")
+    if candidate_count.detect(rime, "rime_ice") != 5:
+        errors.append("恢复默认后应回到方案包的 5")
+    if scoped.exists() and scoped.read_text(encoding="utf-8").strip():
+        errors.append("恢复默认后方案级 custom 不应残留内容")
+
+    # ---- 任务步骤：写配置 + 重新部署（page_size 不是热加载项） ----
+    steps = candidate_count.build_apply_steps(7, rime, "fcitx5-rime")
+    if len(steps) != 2:
+        errors.append(f"设置候选数应为「写配置 + 重新部署」两步，实际 {len(steps)}")
+    else:
+        if "--page-size" not in steps[0].argv or "7" not in steps[0].argv:
+            errors.append(f"写配置步骤参数异常: {steps[0].argv}")
+        if str(rime) not in steps[0].argv:
+            errors.append("写配置步骤缺少 --rime-conf 目标目录")
+        if "rime_deployer" not in " ".join(steps[1].argv):
+            errors.append("第二步应是重新部署（否则候选数不会生效）")
+    if len(candidate_count.build_revert_steps(rime, "fcitx5-rime")) != 2:
+        errors.append("恢复默认同样应包含重新部署")
+
+    # ---- UI：下拉值域 / 当前值回填 / 意图发射 / busy 与无目录禁用 ----
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    if QApplication.instance() is None:
+        errors.append("候选数 UI 检查需要 QApplication")
+        return errors
+
+    # 主题路径注入：外观页会顺带枚举主题，全部重定向到临时目录（防污染真机）
+    themes_dir = base / "themes"
+    sys_dir = base / "sys-themes"
+    themes_dir.mkdir()
+    sys_dir.mkdir()
+    conf_file = base / "classicui.conf"
+    conf_file.write_text("Theme=default\nDarkTheme=default\n", encoding="utf-8")
+    originals = (
+        appearance.fcitx5_conf_path,
+        appearance.user_themes_dir,
+        appearance.system_themes_dir,
+        appearance.theme_backup_path,
+    )
+    appearance.fcitx5_conf_path = lambda: conf_file
+    appearance.user_themes_dir = lambda: themes_dir
+    appearance.system_themes_dir = lambda: sys_dir
+    appearance.theme_backup_path = lambda: base / "backup.orig"
+    original_lang = i18n.current()
+    i18n.set_language(i18n.ZH)
+    try:
+        report = EnvReport(recommended_frontend="fcitx5-rime", rime_user_dir=rime)
+        page = AppearancePage(report, StateMachine(report))
+        page.bind(report, StateMachine(report))
+        buttons = page.page_size_buttons
+        if sorted(buttons) != list(range(1, candidate_count.PAGE_SIZE_MAX + 1)):
+            errors.append(f"候选数刻度应覆盖 1–9，实际 {sorted(buttons)}")
+        if not page.page_size_group.exclusive():
+            errors.append("刻度按钮应互斥（同时只能选中一个档位）")
+        checked = [v for v, b in buttons.items() if b.isChecked()]
+        if checked != [5]:
+            errors.append(f"无配置时应回填方案包的 5，实际选中 {checked}")
+        if page.page_size_revert_button.isEnabled():
+            errors.append("未写过配置时「恢复默认」应禁用")
+        if page.page_size_hint.text() != page._page_size_level_text(5):
+            errors.append("档位说明未跟随当前候选数")
+        if page.page_size_row.itemAt(page.page_size_row.count() - 1).widget().text() != i18n.tr(
+            "appearance.page_size_value", n=5
+        ):
+            errors.append("状态行未显示当前候选数")
+
+        emitted: list[int] = []
+        page.page_size_requested.connect(emitted.append)
+        page._on_page_size_clicked(9)
+        if emitted != [9]:
+            errors.append(f"选 9 应发出一次意图，实际 {emitted}")
+
+        # 真实鼠标点击：自组刻度最容易「点了没反应」，这里用真事件证明
+        candidate_count.write_page_size(rime, 7)
+        page._fill()
+        page.resize(1000, 700)
+        page.show()
+        QApplication.processEvents()
+        before_click = len(emitted)
+        QTest.mouseClick(page.page_size_buttons[7], Qt.MouseButton.LeftButton)
+        if len(emitted) != before_click:
+            errors.append("点击当前档位不应重复部署（应视为无操作）")
+        QTest.mouseClick(page.page_size_buttons[8], Qt.MouseButton.LeftButton)
+        if emitted[-1:] != [8]:
+            errors.append(f"真实点击刻度应发出意图，实际 {emitted}")
+        page.hide()
+
+        # 写下配置后再点同一个值：不应再触发一次部署 + 框架重启
+        candidate_count.write_page_size(rime, 9)
+        page._fill()
+        before = len(emitted)
+        page._on_page_size_clicked(9)
+        if len(emitted) != before:
+            errors.append("选中当前值且配置已存在时不应重复部署")
+        if not page.page_size_revert_button.isEnabled():
+            errors.append("写过配置后「恢复默认」应可用")
+        if page.page_size_scoped.isHidden():
+            errors.append("有方案自带 page_size 时应提示方案级补丁")
+
+        page.set_busy(True, "写入候选词数量")
+        if any(b.isEnabled() for b in page.page_size_buttons.values()):
+            errors.append("busy 时候选数刻度应禁用")
+        page.set_busy(False)
+
+        # 无配置目录：禁用并给出原因（避免点了静默失败）
+        bare = EnvReport(recommended_frontend="fcitx5-rime")
+        bare_page = AppearancePage(bare, StateMachine(bare))
+        bare_page.bind(bare, StateMachine(bare))
+        if any(b.isEnabled() for b in bare_page.page_size_buttons.values()):
+            errors.append("未识别配置目录时候选数刻度应禁用")
+        if not bare_page.page_size_buttons[5].toolTip():
+            errors.append("未识别配置目录时应给出禁用原因")
+    finally:
+        (
+            appearance.fcitx5_conf_path,
+            appearance.user_themes_dir,
+            appearance.system_themes_dir,
+            appearance.theme_backup_path,
+        ) = originals
+        i18n.set_language(original_lang)
+    return errors
 
 
 def check_runner() -> list[str]:
@@ -5065,9 +5828,67 @@ def check_window() -> list[str]:
                     errors.append(f"修复步骤内容异常: {fix_cmd[:100]}")
             window._set_busy(False)
 
+            # v1.0.37：引擎页「清理残留」意图。确认框 monkeypatch（真弹会
+            # 阻塞无头环境）；取消不起任务、确认后起 residue-clean 且步骤
+            # 含 chown/sed/staging 清理，进度回到引擎页。
+            import ui.main_window as _mw
+
+            class _FakeResidueBox:
+                def __init__(self, *args, **kwargs) -> None:
+                    self.args = args
+
+                def exec(self) -> bool:
+                    return _FakeResidueBox.answer
+
+            original_residue_box = _mw.MessageBox
+            try:
+                _mw.MessageBox = _FakeResidueBox  # type: ignore[assignment]
+                fake_items = [
+                    residue.ResidueItem(residue.FOREIGN_OWNER, "d", "/tmp/x"),
+                    residue.ResidueItem(
+                        residue.STALE_SCHEMA, "d", "/tmp/y", ref="gone"
+                    ),
+                    residue.ResidueItem(residue.STAGING, "d", "/tmp/z"),
+                ]
+                orig_dir = window.report.rime_user_dir
+                window.report.rime_user_dir = tmp_base / "residue-intent"
+                window.report.rime_user_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    # 取消：不得起任务
+                    _FakeResidueBox.answer = False
+                    captured.clear()
+                    window.engine_page.residue_clean_requested.emit(fake_items)
+                    app.processEvents()
+                    if captured:
+                        errors.append("取消残留清理时不应起任务")
+                    # 确认：起 residue-clean，步骤覆盖三类残留
+                    _FakeResidueBox.answer = True
+                    captured.clear()
+                    window.engine_page.residue_clean_requested.emit(fake_items)
+                    app.processEvents()
+                    if not captured:
+                        errors.append("残留清理意图未构建任务")
+                    else:
+                        clean_cmd = " ".join(" ".join(s.argv) for s in captured[0])
+                        if "chown" not in clean_cmd:
+                            errors.append("残留清理应含 chown 步")
+                        if "sed -i" not in clean_cmd:
+                            errors.append("残留清理应含 sed 清理步")
+                        if residue.STAGING_NAME not in clean_cmd:
+                            errors.append("残留清理应删暂存目录")
+                        if window._task_kind != "residue-clean":
+                            errors.append(f"残留清理任务类型异常: {window._task_kind}")
+                        if window._target_page() is not window.engine_page:
+                            errors.append("残留清理进度应显示在引擎页")
+                    window._set_busy(False)
+                finally:
+                    window.report.rime_user_dir = orig_dir
+            finally:
+                _mw.MessageBox = original_residue_box
+            window._set_busy(False)
+
             # v1.0.27：写入登录配置的次要入口。确认框 monkeypatch——
             # 真弹会阻塞无头环境，真跑会改本机 ~/.xsessionrc。
-            import ui.main_window as _mw
 
             class _FakeBox:
                 def __init__(self, *args, **kwargs) -> None:
@@ -5138,6 +5959,26 @@ def check_window() -> list[str]:
             if worker is not None and worker.isRunning():
                 worker.wait(10000)
             app.processEvents()
+
+            # v1.0.38：方案切换意图——无确认框，直接构建 scheme-switch 任务；
+            # 步骤链 = 入列（如缺）+ 写 user.yaml + 部署重启，进度回方案页
+            captured.clear()
+            window.scheme_page.switch_requested.emit("rime_ice")
+            app.processEvents()
+            if not captured:
+                errors.append("方案切换意图未构建任务")
+            else:
+                switch_cmd = " ".join(" ".join(s.argv) for s in captured[0])
+                if "schema_list" not in switch_cmd:
+                    errors.append(f"切换链应确保方案在 schema_list: {switch_cmd[:120]}")
+                if "previously_selected_schema" not in switch_cmd:
+                    errors.append("切换链应写 user.yaml 的 previously_selected_schema")
+                if window._task_kind != "scheme-switch":
+                    errors.append(f"方案切换任务类型异常: {window._task_kind}")
+                if window._target_page() is not window.scheme_page:
+                    errors.append("方案切换进度应显示在方案页")
+            window._set_busy(False)
+            window.scheme_page.set_busy(False)
 
             # 镜像切换意图：v1.0.5 起合并为单步单次提权（写源 + apt update）
             captured.clear()
@@ -5237,7 +6078,7 @@ def main() -> int:
 
     failures += check_resources()
 
-    assert config.VERSION == "1.0.36", "版本号与执行计划不一致"
+    assert config.VERSION == "1.0.42", "版本号与执行计划不一致"
     config.ensure_user_dirs()
     for d in (
         config.USER_DATA_DIR,
@@ -5272,6 +6113,8 @@ def main() -> int:
         ("i18n", check_i18n),
         ("watchdog", check_watchdog),
         ("deploy_guide", check_deploy_guide),
+        ("residue", check_residue),
+        ("schema_switch", check_schema_switch),
         ("skin", check_skin),
         ("appearance", check_appearance),
         ("theme_import", check_theme_import),
@@ -5290,6 +6133,8 @@ def main() -> int:
         _run_check("skin_ui", check_skin_ui)
         # 外观页（fcitx5 主题 / ibus 外观项）离屏检查
         _run_check("appearance_ui", check_appearance_ui)
+        # v1.0.41：候选词数量（menu/page_size）——核心读写 + 页面回填/意图
+        _run_check("candidate_count", check_candidate_count)
         # 皮肤主窗口端到端（runner 执行 CLI + 记账 + 卸载）
         _run_check("skin_flow", check_skin_flow)
         # 外观主窗口端到端（主题切换/还原 + ibus 应用/还原，路径注入防污染真机）
@@ -5297,6 +6142,10 @@ def main() -> int:
         _run_check("runner", check_runner)
         _run_check("scheme_install_flow", check_scheme_install_flow)
         _run_check("snapshot_cli", check_snapshot_cli)
+        # v1.0.37：残留清理端到端（runner 真跑：备份 + sed 清理 + staging
+        # 删除）——有文件删除，整轮冒烟易被 safe-delete 钩子配额拦掉，
+        # 与 snapshot_cli 同款放进 rerun_flow_checks 可逐项补跑
+        _run_check("residue_clean", check_residue_clean)
 
     if failures:
         print("SMOKE FAILED")
@@ -5306,7 +6155,8 @@ def main() -> int:
     print(
         f"SMOKE OK — {config.APP_NAME} v{config.VERSION} "
         "资源/检测/平台回退+GL渲染决策/状态机/日志/引擎装卸/方案装卸/manifest/快照备份/环境体检/apt镜像/apt源代号/apt源可用性/版本通配/部署引导/深浅色主题/启动标记/launcher重试链/deb依赖/动效/i18n/窗口验证通过"
-        "（含皮肤装卸/切换/默认、fcitx5主题切换+自动重启生效+ibus外观项切换与还原）"
+        "（含皮肤装卸/切换/默认、fcitx5主题切换+自动重启生效+ibus外观项切换与还原、"
+        "候选词数量读写与方案级补丁）"
     )
     return 0
 

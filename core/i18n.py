@@ -46,6 +46,7 @@ ZH_TEXT = {
     "app.title": "中州韵输入法安装器",
     # ---- 通用 ----
     "common.install": "安装",
+    "common.reinstall": "重新安装",
     "common.uninstall": "卸载",
     "common.refresh": "刷新",
     "common.cancel": "取消",
@@ -154,8 +155,53 @@ ZH_TEXT = {
     # ---- 页面按钮 / 选项 ----
     "engine.update_apt": "安装前更新软件源（apt update）",
     "engine.purge": "同时删除配置与词库（不可恢复）",
+    # v1.0.37：手动安装残留清理（引擎页）
+    "engine.clean_residue": "清理残留",
+    "engine.clean_residue_tip": (
+        "清理手动安装 rime 留下的残留：root 属主的文件、失效的方案引用、"
+        "上次部署中断的暂存目录。清理前自动备份，不删除你的配置文件"
+    ),
+    "row.residue": "安装残留",
+    "residue.none": "未发现残留",
+    "residue.summary": "发现 {total} 项残留：{parts}",
+    "residue.parts_sep": "、",
+    "residue.kind.foreign_owner": "属主异常 {n} 项",
+    "residue.kind.stale_schema": "失效方案引用 {n} 项",
+    "residue.kind.staging": "暂存目录 {n} 项",
+    "residue.kind.shared_stale": "共享配置失效引用 {n} 项",
+    "residue.detail.foreign_owner": "属主不是当前用户（疑似 sudo 复制残留）：{path}",
+    "residue.detail.stale_schema": "方案引用「{ref}」找不到对应的 .schema.yaml（部署会报 missing input schema）",
+    "residue.detail.staging": "上次部署被中断留下的暂存目录：{path}",
+    "residue.detail.shared_stale": "方案引用「{ref}」找不到对应的 .schema.yaml（在共享配置 {path} 里，需手动编辑）",
     "scheme.custom_install": "安装自定义方案",
     "scheme.check_update": "检查更新",
+    # ---- 方案切换（v1.0.38） ----
+    "scheme.enable": "启用",
+    "scheme.enable_tip": "切换到这个方案：自动加入可选列表并重启输入法框架，约 1 秒生效",
+    "scheme.enable_multi_tip": "该包装入了 {n} 个方案，将启用主方案「{name}」；其余变体可在上方「当前方案」下拉里切换",
+    "scheme.current_schema": "✓ 当前方案",
+    "scheme.not_installed": "该方案尚未安装",
+    "scheme.not_installed_no_update": "该方案尚未安装，无需检查更新",
+    "scheme.no_schema_files": "未检测到该方案包提供的输入方案文件",
+    "scheme.install_tip": "安装该方案到当前 rime 配置目录",
+    "scheme.reinstall_tip": "重新安装该方案（aria2 拉取最新内容）",
+    "scheme.uninstall_tip": "卸载该方案并还原被覆盖的文件",
+    "scheme.check_update_tip": "下载上游内容并与本地指纹对比",
+    "scheme.switchable_label": "已安装方案（点击切换）",
+    "scheme.switchable_none": "未检测到可切换的方案",
+    "scheme.not_in_list_tip": "不在可选列表，切换时会自动加入",
+    "scheme.source.installer": "来源：本安装器安装",
+    "scheme.source.manual": "来源：手动安装（只可切换，卸载请手动清理）",
+    "scheme.source.shared": "来源：系统共享目录",
+    # ---- 方案切换器（v1.0.39：胶囊墙 → 按包分组的下拉菜单） ----
+    "scheme.switcher_tip": "切换当前输入方案（下拉列表按方案包分组）",
+    "scheme.switcher_hint": "点此切换，约 1 秒生效",
+    "scheme.not_in_list_short": "未入列表",
+    "scheme.group.manual": "手动安装",
+    "scheme.group.shared": "系统共享",
+    "scheme.group.other": "其他",
+    "row.install_status": "安装状态",
+    "row.current_schema": "当前方案",
     # ---- 皮肤（F15：写入用户目录的配色，不下载仓库） ----
     "scheme.apply": "应用皮肤",
     "scheme.reapply": "重新应用",
@@ -204,7 +250,7 @@ ZH_TEXT = {
     "scheme.section_skins": "皮肤",
     # ---- 外观（v1.0.13：fcitx5 主题 + ibus 全局项，Linux 真实可见） ----
     "appearance.title": "外观",
-    "appearance.subtitle": "Linux 上候选窗由输入法框架绘制，rime 配色不渲染；这里切换 fcitx5 主题 / 设置 ibus 外观项，即时真实可见",
+    "appearance.subtitle": "Linux 上候选窗由输入法框架绘制，rime 配色不渲染；这里设置每页候选数量、切换 fcitx5 主题 / ibus 外观项，即时真实可见",
     "appearance.frontend_row": "当前前端",
     "appearance.theme_row": "fcitx5 当前主题",
     "appearance.ibus_row": "ibus 当前外观",
@@ -292,6 +338,30 @@ ZH_TEXT = {
     "msg.ibus_style_applied_hint": "配置已写入 ibus_rime.custom.yaml，注销重登或重启 ibus 后生效",
     "msg.ibus_style_reverted": "ibus 外观已恢复默认",
     "msg.ibus_style_reverted_hint": "本安装器写入的 ibus 外观配置块已移除",
+    # ---- 候选词数量（v1.0.41：rime 的 menu/page_size，fcitx5 / ibus 通用） ----
+    "appearance.section_candidates": "候选窗（rime 引擎）",
+    "appearance.page_size_row": "候选词数量",
+    "appearance.page_size_title": "每页候选词数量",
+    "appearance.page_size_value": "{n} 个",
+    # 刻度上选中档位的一句话解释（跟随点击变化，回答「我该选几」）
+    "appearance.page_size_level_default": "默认档位：与 rime 官方文档一致，也是多数方案的出厂设置。",
+    "appearance.page_size_level_recommend": "推荐档位：翻页更少，候选窗高度也还在舒适范围。",
+    "appearance.page_size_level_max": "上限档位：一页看全，竖排已接近屏幕高度。",
+    "appearance.page_size_level_other": "自定义档位：在翻页次数与候选窗高度之间取折中。",
+    "appearance.page_size_note": "改动后自动重新部署并重启框架，约 1 秒生效 · 翻页键 , . 或 - =",
+    "appearance.page_size_tip_default": "默认档位：与 rime 官方文档一致，多数方案的出厂值",
+    "appearance.page_size_tip_recommend": "推荐档位：一页 7 个，翻页更少，候选窗高度仍在舒适范围",
+    "appearance.page_size_tip_max": "上限档位：一页 9 个。第 10 个候选需按 0 键，各方案对 0 键的支持不一致，故不开放",
+    "appearance.page_size_revert": "恢复默认",
+    "appearance.page_size_revert_tip": "移除本安装器写入的候选数配置（回到方案 / 引擎自带的值）",
+    "appearance.page_size_scoped": "另有 {count} 个方案自带候选数设置（写在方案文件里），保存时会一并写入方案级配置。",
+    "msg.page_size_applied": "候选词数量已设为 {n} 个",
+    "msg.page_size_applied_hint": "已重新部署，下一次输入即按新数量分页显示候选",
+    "msg.page_size_reverted": "候选词数量已恢复默认",
+    "msg.page_size_reverted_hint": "安装器写入的候选数配置已移除并重新部署",
+    "msg.page_size_failed": "候选词数量设置失败",
+    "msg.page_size_failed_hint": "配置目录可能不可写（曾用 sudo 复制过配置会把属主改成 root）。"
+    "可到「环境修复」页清理安装残留后再试，或手动检查配置目录权限。",
     # ---- 行标签（多页共用） ----
     "row.rime_dir": "配置目录",
     "row.frontend": "目标前端",
@@ -470,8 +540,40 @@ ZH_TEXT = {
     "msg.deploy_failed": "重新部署未完成",
     "msg.deploy_failed_hint": (
         "原配置目录未被删除，输入法仍可继续使用。若提示找不到 rime_deployer，"
-        "Ubuntu 需另装 librime-bin（sudo apt install librime-bin）后重试；"
+        "需另装 librime-bin（sudo apt install librime-bin）后重试；"
+        "若提示配置目录不可写，多是手动安装时用 sudo 复制过文件，"
+        "执行 sudo chown -R \"$USER\" <配置目录> 即可；详细原因见「日志」页，"
         "也可在输入法里切换一次 Rime 触发部署"
+    ),
+    # v1.0.37：手动安装残留清理（确认框 + 结果提示）
+    "msg.residue_confirm": "清理手动安装残留？",
+    "msg.residue_confirm_body": (
+        "将按以下顺序处理（你的配置文件不会被删除）：\n"
+        "{actions}\n"
+        "{manual}"
+    ),
+    "msg.residue_action_backup": "· 先在备份目录生成一份完整备份（可随时从「备份」页恢复）",
+    "msg.residue_action_chown": "· 修复 {n} 个文件/目录的属主为当前用户（chown，需要管理员密码）",
+    "msg.residue_action_yaml": "· 从 default.custom.yaml 删除 {n} 行失效方案引用（改前备份为 default.custom.yaml.rime-installer-bak）",
+    "msg.residue_action_staging": "· 删除上次部署中断残留的暂存目录 build.rime-new",
+    "msg.residue_manual_note": "另有 {n} 项写在共享配置（如 /usr/share/rime-data/default.yaml）里，只能手动编辑，本次不会改动。",
+    "msg.residue_cleaned": "残留已清理",
+    "msg.residue_cleaned_hint": (
+        "属主与失效引用已处理，备份留在「备份」页；"
+        "如刚才修复过属主，建议再到体检页点一次「重新部署」"
+    ),
+    "msg.residue_clean_failed": "残留清理未完成",
+    "msg.residue_clean_failed_hint": (
+        "清理过程被中断，未删除你的配置文件；"
+        "请前往「日志」页查看详细输出，排除原因后重试"
+    ),
+    # v1.0.38：方案切换
+    "msg.schema_switched": "已切换方案",
+    "msg.schema_switched_hint": "「{name}」已设为当前方案，输入法框架已重启，即刻生效",
+    "msg.schema_switch_failed": "方案切换未完成",
+    "msg.schema_switch_failed_hint": (
+        "你的配置未被破坏（两处 yaml 改前都已留 .bak 备份）；"
+        "请前往「日志」页查看详细输出，排除原因后重试"
     ),
     # ---- 提示类（InfoBar） ----
     "msg.no_rime_dir": "无法确定配置目录",

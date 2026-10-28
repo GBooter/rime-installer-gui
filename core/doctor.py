@@ -25,9 +25,10 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core import apt_health, apt_mirror, im_env
-from core.deploy_guide import build_deploy_script
+from core import apt_health, apt_mirror, i18n, im_env, residue
+from core.deploy_guide import build_deploy_script, find_deployer
 from core.detector import EnvReport
+from core.engine_service import build_deployer_install_step
 from core.runner import Step
 
 # 体检结果级别
@@ -240,6 +241,65 @@ def _read_os_release() -> dict[str, str]:
         key, _, value = line.partition("=")
         data[key.strip()] = value.strip().strip('"').strip("'")
     return data
+
+
+def _residue_check(rime_dir: Path | None) -> CheckResult:
+    """v1.0.37：手动安装残留（root 属主文件 / 失效方案引用 / 暂存目录）。
+
+    单独一项而不并进「部署状态」：残留存在时部署**看起来**是好的
+    （目录读得出来、旧 build 还在），只有重新部署会失败——用户完全
+    看不出为什么。清理要 chown（管理员密码），不进「一键修复」。
+    """
+    if rime_dir is None:
+        return CheckResult(
+            "residue",
+            "安装残留",
+            INFO,
+            "未能识别 rime 用户目录，跳过残留检查",
+            i18n_key="doctor.check.residue.no_dir",
+        )
+    if not _is_dir(rime_dir):
+        return CheckResult(
+            "residue",
+            "安装残留",
+            INFO,
+            f"{rime_dir} 尚不存在，无残留可查",
+            i18n_key="doctor.check.residue.absent",
+            i18n_params={"path": str(rime_dir)},
+        )
+    items = residue.scan(rime_dir)
+    if not items:
+        return CheckResult(
+            "residue",
+            "安装残留",
+            OK,
+            "未发现手动安装残留",
+            i18n_key="doctor.check.residue.ok",
+        )
+    tally = residue.counts(items)
+    # parts 子串按当前语言组合（i18n 键与引擎页同源）——否则英文模板里会
+    # 被塞进中文片段（v1.0.5 修过的「英文界面漏中文」同类问题）。
+    # 切语言时主窗口会 _dispatch → bind → 重跑 checks，此处随之重组。
+    sep = i18n.tr("residue.parts_sep")
+    parts = sep.join(
+        i18n.tr(f"residue.kind.{kind}", n=tally[kind])
+        for kind in residue.DISPLAY_ORDER
+        if tally.get(kind)
+    )
+    # 建议文案保持与英文包同构（单一 i18n 键）：共享配置里的失效引用只能
+    # 手动编辑——具体文件路径在「引擎」页残留一行的提示框里逐条列出。
+    return CheckResult(
+        "residue",
+        "安装残留",
+        WARN,
+        f"发现 {len(items)} 项残留：{parts}",
+        "到「引擎」页点「清理残留」自动处理（改前自动备份）",
+        i18n_key="doctor.check.residue.dirty",
+        i18n_params={
+            "total": str(len(items)),
+            "parts": parts,
+        },
+    )
 
 
 def _apt_codename_check() -> CheckResult:
@@ -942,6 +1002,12 @@ def run_checks(report: EnvReport, installed_scheme_keys: list[str] | None = None
             )
         )
 
+    # 7.5 手动安装残留（v1.0.37）：sudo 复制留下的 root 属主文件、失效的
+    # schema_list 引用、被强杀留下的暂存目录——都会让「重新部署」莫名失败，
+    # 而各项体检可能全是绿的（目录读得出来）。这里单独一项点名，清理入口
+    # 在「引擎」页（chown 要管理员密码，不进「一键修复」的静默步骤流）。
+    results.append(_residue_check(rime_dir))
+
     # 8. apt 源代号一致性（v1.0.31）：系统升级后旧代号残留的探测。
     # 放在最后：它与 rime 本身无关，属于「升级后还能不能装」的基础设施检查；
     # 不可自动修复（改哪个源是用户的决定），只给 WARN 与处理指引。
@@ -988,14 +1054,22 @@ def build_fix_steps(key: str, report: EnvReport) -> list[Step]:
     if key == "deployed" and rime_dir is not None:
         # v1.0.6：主动部署（rime_deployer 编译生成 build），不再依赖框架惰性部署
         # v1.0.26：编译进 staging，失败保留原 build 并 exit 1（不再假成功）
-        return [
+        # v1.0.37：缺 rime_deployer 时先 best-effort 装 librime-bin——手动按
+        # 教程装过引擎的机器基本都没有它（各发行版的引擎包都不依赖它），
+        # 缺它时重新部署只能靠引擎惰性部署、成功率低。装不上只警告，
+        # 部署脚本随后走重启框架兜底，不判任务失败。
+        steps: list[Step] = []
+        if find_deployer() is None:
+            steps.append(build_deployer_install_step())
+        steps.append(
             Step(
                 "重新部署（rime_deployer 编译 + 重启框架）",
                 ["bash", "-c", build_deploy_script(frontend, rime_dir)],
                 weight=1,
                 hint_key="msg.deploy_failed",
             )
-        ]
+        )
+        return steps
 
     if key == "input_source" and frontend == "ibus-rime":
         # v1.0.26：非 GNOME/Cinnamon 桌面不写 gsettings（写了没人读，还会误报已修复）

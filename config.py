@@ -14,14 +14,16 @@ from pathlib import Path
 APP_NAME = "中州韵输入法安装器"
 APP_NAME_EN = "RIME Installer"
 APP_ID = "rime-installer"
-VERSION = "1.0.36"
+VERSION = "1.0.42"
 AUTHOR = "Feelup"
 # 适用系统：实测最低版本 + 显示服务端（X11 / Wayland）。
 # v1.0.30：改为**区间式**（下限定死、上沿不封顶）——版本通配判定见
 # core/compat.py（家族 + 最低版本元组比较，不枚举具体版本），用户系统
 # 升级到更高版本（Ubuntu 26.04 之后、Mint 23 等）无需改代码即自动落入
 # 支持区间；具体「当前系统是否受支持」由设置页按运行时探测结果展示。
-SUPPORTED_SYSTEMS = "Ubuntu 24.04 及以上 / Linux Mint 22 及以上 / Deepin 25.2 及以上（X11 / Wayland）"
+# v1.0.37：UOS 25 真机反馈后显式写上 UOS（compat 的 uos 家族 1.0.30 起
+# 已纳入，这里只是让适用系统文案与判定一致）。
+SUPPORTED_SYSTEMS = "Ubuntu 24.04 及以上 / Linux Mint 22 及以上 / Deepin 25.2 及以上（含 UOS 25，X11 / Wayland）"
 
 
 def _project_root() -> Path:

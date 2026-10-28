@@ -21,6 +21,7 @@ EN_TEXT: dict[str, str] = {
     "app.title": "RIME Installer",
     # ---- 通用 ----
     "common.install": "Install",
+    "common.reinstall": "Reinstall",
     "common.uninstall": "Uninstall",
     "common.refresh": "Refresh",
     "common.cancel": "Cancel",
@@ -56,6 +57,35 @@ EN_TEXT: dict[str, str] = {
     "engine.uninstall": "Uninstall engine",
     "engine.installing": "Installing engine",
     "engine.uninstalling": "Uninstalling engine",
+    # v1.0.37: manual-install residue cleanup (Engine page)
+    "engine.clean_residue": "Clean residue",
+    "engine.clean_residue_tip": (
+        "Remove residue left by a manual RIME install: root-owned files, "
+        "stale schema references, and staging directories from an interrupted "
+        "deploy. A backup is taken first; your configuration files are kept"
+    ),
+    "row.residue": "Install residue",
+    "residue.none": "No residue found",
+    "residue.summary": "Found {total} residue items: {parts}",
+    "residue.parts_sep": ", ",
+    "residue.kind.foreign_owner": "wrong owner ×{n}",
+    "residue.kind.stale_schema": "stale schema refs ×{n}",
+    "residue.kind.staging": "staging dir ×{n}",
+    "residue.kind.shared_stale": "stale refs in shared config ×{n}",
+    "residue.detail.foreign_owner": (
+        "Owned by another user (likely a sudo copy residue): {path}"
+    ),
+    "residue.detail.stale_schema": (
+        "Schema reference “{ref}” has no matching .schema.yaml "
+        "(deploy fails with missing input schema)"
+    ),
+    "residue.detail.staging": (
+        "Staging directory left by an interrupted deploy: {path}"
+    ),
+    "residue.detail.shared_stale": (
+        "Schema reference “{ref}” has no matching .schema.yaml "
+        "(in the shared config {path}; edit manually)"
+    ),
     # ---- 方案页 ----
     "scheme.title": "Scheme Market",
     "scheme.subtitle": (
@@ -146,6 +176,45 @@ EN_TEXT: dict[str, str] = {
     "engine.purge": "Also delete configuration and dictionaries (irreversible)",
     "scheme.custom_install": "Install custom scheme",
     "scheme.check_update": "Check for updates",
+    # v1.0.38: scheme switching
+    "scheme.enable": "Enable",
+    "scheme.enable_tip": (
+        "Switch to this scheme: it is added to the selectable list and the "
+        "input method framework restarts — effective in about 1 second"
+    ),
+    "scheme.enable_multi_tip": (
+        "This package provides {n} schemes; the main one, “{name}”, will be "
+        "activated. Pick the others from the Current scheme dropdown above"
+    ),
+    "scheme.current_schema": "✓ Current",
+    "scheme.not_installed": "This scheme is not installed yet",
+    "scheme.not_installed_no_update": (
+        "This scheme is not installed yet; no update check needed"
+    ),
+    "scheme.no_schema_files": (
+        "No input schema files were detected for this package"
+    ),
+    "scheme.install_tip": "Install this scheme into the current RIME config directory",
+    "scheme.reinstall_tip": "Reinstall this scheme (aria2 fetches the latest)",
+    "scheme.uninstall_tip": "Uninstall this scheme and restore overwritten files",
+    "scheme.check_update_tip": "Download upstream content and compare fingerprints",
+    "scheme.switchable_label": "Installed schemes (click to switch)",
+    "scheme.switchable_none": "No switchable schemes detected",
+    "scheme.not_in_list_tip": "Not in the selectable list; it will be added on switch",
+    "scheme.source.installer": "Source: installed by this tool",
+    "scheme.source.manual": (
+        "Source: manual install (switchable only; uninstall manually)"
+    ),
+    "scheme.source.shared": "Source: system shared directory",
+    # v1.0.39: scheme switcher (chip wall replaced by a grouped dropdown)
+    "scheme.switcher_tip": "Switch the current input scheme (list grouped by package)",
+    "scheme.switcher_hint": "Click to switch, effective in ~1s",
+    "scheme.not_in_list_short": "not listed",
+    "scheme.group.manual": "Manually installed",
+    "scheme.group.shared": "System shared",
+    "scheme.group.other": "Other",
+    "row.install_status": "Install status",
+    "row.current_schema": "Current scheme",
     # ---- Skins (F15: color presets written to the user directory) ----
     "scheme.apply": "Apply skin",
     "scheme.reapply": "Apply again",
@@ -216,7 +285,7 @@ EN_TEXT: dict[str, str] = {
     "scheme.section_skins": "Skins",
     # ---- Appearance (v1.0.13: fcitx5 themes + ibus global options, visible on Linux) ----
     "appearance.title": "Appearance",
-    "appearance.subtitle": "On Linux the candidate window is drawn by the framework and RIME color schemes are not rendered; switch fcitx5 themes / set ibus options here for real, visible results",
+    "appearance.subtitle": "On Linux the candidate window is drawn by the framework and RIME color schemes are not rendered; set candidates per page, switch fcitx5 themes / ibus options here for real, visible results",
     "appearance.frontend_row": "Current frontend",
     "appearance.theme_row": "fcitx5 current theme",
     "appearance.ibus_row": "ibus current appearance",
@@ -302,6 +371,29 @@ EN_TEXT: dict[str, str] = {
     "msg.ibus_style_applied_hint": "Written to ibus_rime.custom.yaml; log out or restart ibus to apply",
     "msg.ibus_style_reverted": "ibus appearance restored",
     "msg.ibus_style_reverted_hint": "The ibus appearance block written by this installer has been removed",
+    # ---- Candidate page size (v1.0.41: rime menu/page_size, shared by fcitx5 / ibus) ----
+    "appearance.section_candidates": "Candidate window (rime engine)",
+    "appearance.page_size_row": "Candidates per page",
+    "appearance.page_size_title": "Candidates per page",
+    "appearance.page_size_value": "{n}",
+    "appearance.page_size_level_default": "Default level: matches the rime docs and is the factory value of most schemes.",
+    "appearance.page_size_level_recommend": "Recommended level: less paging, the window stays comfortably short.",
+    "appearance.page_size_level_max": "Maximum level: the whole page at a glance; a vertical window is nearly screen height.",
+    "appearance.page_size_level_other": "Custom level: a trade-off between paging and candidate window height.",
+    "appearance.page_size_note": "Redeploys and restarts the framework automatically, effective in about 1s · Page keys: , . or - =",
+    "appearance.page_size_tip_default": "Default level: matches the rime docs, the factory value of most schemes",
+    "appearance.page_size_tip_recommend": "Recommended level: 7 per page, less paging while the window stays comfortably short",
+    "appearance.page_size_tip_max": "Maximum level: 9 per page. The 10th candidate needs the 0 key, which schemes handle inconsistently, so it is not offered",
+    "appearance.page_size_revert": "Restore default",
+    "appearance.page_size_revert_tip": "Remove the page-size setting written by this installer (back to the scheme / engine value)",
+    "appearance.page_size_scoped": "{count} installed scheme(s) define their own page size in the scheme file; a scheme-level override is written as well.",
+    "msg.page_size_applied": "Candidates per page set to {n}",
+    "msg.page_size_applied_hint": "Redeployed — the next input shows candidates paged by the new size",
+    "msg.page_size_reverted": "Candidates per page restored to default",
+    "msg.page_size_reverted_hint": "The page-size setting written by the installer was removed and redeployed",
+    "msg.page_size_failed": "Failed to set candidates per page",
+    "msg.page_size_failed_hint": "The configuration directory may not be writable (copying configs with sudo changes ownership to root). "
+    "Try cleaning install residue on the Doctor page, or check the directory permissions.",
     # ---- 行标签（多页共用） ----
     "row.rime_dir": "Configuration directory",
     "row.frontend": "Target frontend",
@@ -557,6 +649,20 @@ EN_TEXT: dict[str, str] = {
     ),
     "doctor.check.rime_dir.absent.advice": (
         "RIME creates this directory after a scheme is installed"
+    ),
+    # v1.0.37: manual-install residue (EN-only; Chinese comes from doctor.py)
+    "doctor.check.residue.title": "Install residue",
+    "doctor.check.residue.no_dir.detail": (
+        "Could not locate the RIME user directory; residue check skipped"
+    ),
+    "doctor.check.residue.absent.detail": (
+        "{path} does not exist yet; nothing to check"
+    ),
+    "doctor.check.residue.ok.detail": "No manual-install residue found",
+    "doctor.check.residue.dirty.detail": "Found {total} residue items: {parts}",
+    "doctor.check.residue.dirty.advice": (
+        "Open the Engine page and click “Clean residue” (a backup is taken "
+        "first); hover the residue row there for the full list with paths"
     ),
     "doctor.check.apt_codename.title": "apt source codename",
     "doctor.check.apt_codename.non_ubuntu.detail": (
@@ -816,9 +922,60 @@ EN_TEXT: dict[str, str] = {
     "msg.deploy_failed": "Redeploy did not complete",
     "msg.deploy_failed_hint": (
         "Your existing configuration was left untouched and is still usable. "
-        "If rime_deployer was not found, install librime-bin on Ubuntu "
-        "(sudo apt install librime-bin) and retry; switching to Rime once in "
-        "the input method also triggers a deploy"
+        "If rime_deployer was not found, install librime-bin "
+        "(sudo apt install librime-bin) and retry; if the config directory "
+        "is reported as not writable, files were likely copied with sudo "
+        "during a manual install — run sudo chown -R \"$USER\" <config dir>. "
+        "See the Logs page for details; switching to Rime once in the input "
+        "method also triggers a deploy"
+    ),
+    # v1.0.37: manual-install residue cleanup (confirm dialog + results)
+    "msg.residue_confirm": "Clean manual-install residue?",
+    "msg.residue_confirm_body": (
+        "The following steps will run (your configuration files are kept):\n"
+        "{actions}\n"
+        "{manual}"
+    ),
+    "msg.residue_action_backup": (
+        "· Take a full backup first (restorable anytime from the Backup page)"
+    ),
+    "msg.residue_action_chown": (
+        "· Restore ownership of {n} file(s)/directory(ies) to the current "
+        "user (chown; requires the admin password)"
+    ),
+    "msg.residue_action_yaml": (
+        "· Remove {n} stale schema reference line(s) from default.custom.yaml "
+        "(backed up as default.custom.yaml.rime-installer-bak first)"
+    ),
+    "msg.residue_action_staging": (
+        "· Delete the staging directory build.rime-new left by an interrupted deploy"
+    ),
+    "msg.residue_manual_note": (
+        "Another {n} item(s) live in the shared config (e.g. "
+        "/usr/share/rime-data/default.yaml) and can only be edited manually; "
+        "they will not be touched this time."
+    ),
+    "msg.residue_cleaned": "Residue cleaned",
+    "msg.residue_cleaned_hint": (
+        "Ownership and stale references are fixed; the backup stays on the "
+        "Backup page. If ownership was just repaired, run Redeploy once more "
+        "on the Diagnostics page"
+    ),
+    "msg.residue_clean_failed": "Residue cleanup did not complete",
+    "msg.residue_clean_failed_hint": (
+        "The cleanup was interrupted and your configuration files were not "
+        "deleted; see the Logs page for details and retry"
+    ),
+    # v1.0.38: scheme switching
+    "msg.schema_switched": "Scheme switched",
+    "msg.schema_switched_hint": (
+        "“{name}” is now the current scheme; the input method framework has "
+        "restarted, so it takes effect immediately"
+    ),
+    "msg.schema_switch_failed": "Scheme switch did not complete",
+    "msg.schema_switch_failed_hint": (
+        "Your configuration was not damaged (both yaml files were backed up "
+        "as .bak before the change); see the Logs page for details and retry"
     ),
     # ---- 提示类（InfoBar） ----
     "msg.no_rime_dir": "Cannot locate configuration directory",

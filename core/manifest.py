@@ -173,6 +173,24 @@ class Manifest:
     def installed_keys(self) -> set[str]:
         return {p.key for p in self.installed_packages()}
 
+    def package_files(self, key: str) -> list[str]:
+        """该方案包安装时记录的文件清单（v1.0.38：方案切换据此推导 schema_id）。
+
+        顺序即安装顺序（record_files 的 added 在前）——多方案包的「主方案」
+        取第一个。查不到/异常返回空列表，调用方按「无映射」处理。
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT f.path AS path, f.action AS action FROM files f "
+                "JOIN packages p ON p.id = f.package_id "
+                "WHERE p.key=? AND p.status='installed' "
+                "ORDER BY CASE f.action WHEN 'added' THEN 0 ELSE 1 END, f.id",
+                (key,),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 — 清单查询失败不应拖垮调用方
+            return []
+        return [r["path"] for r in rows]
+
     def installed_count(self) -> int:
         return len(self.installed_packages())
 
